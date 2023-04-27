@@ -264,7 +264,7 @@ long updateDelay = 1000; //main menu or run menu update pulse delay. since wind 
 long updateDelayRun = 2000; //slower update loop for run menu
 long updateDelaySensorStats = 300; //update rate for sensorstats, 300 is flickering a bit, 400 is clear.
 long runTimeTicker = 1000; //every 1000 ms, subtract 1 second from the screen counter
-long motorRampSlope = 500; //if this value is small, the motor ramp is fast, if it is large it is slow. a gentlr speed seems to be about 50 ms. used in state machine
+long motorRampSlope = 500; //if this value is small, the motor ramp is fast, if it is large it is slow. a gentlr speed seems to be about 500 ms. used in state machine
 unsigned long previousTime = 0; //state machine time storage variable, unsigned because it lags millis(); by 1000 ms steps
 unsigned long previousTime2 = 0; //needed another one
 unsigned long previousTime3 = 0;
@@ -289,7 +289,7 @@ long loadcellcalibratedmass = 0;
 
 //limits
 //these are designed to be changed by an override by using the wimbdy easter egg, wimbdy is a debug mode and the values set there might be a bit excessive for normal operation. Change these at your peril
-int motorpwmlimit = 1900; //upper limit motor pwm value
+int motorpwmlimit = 1700; //upper limit motor pwm value
 int timelimitrun = 300; //upper time limit (in seconds)
 int velocityTargetLimit = 9;//upper speed limit for velocityTarget
 bool wimbdyDebug = 0; //debug flag, to be used to bring us out of research mode. enables diagnostic serial prints and other stuff
@@ -431,9 +431,10 @@ void setup()
   if ((digitalRead(ENC_SW) == LOW)) {
     lcd.print(" [it heckin WIMBDY] ");
     //debug mode flag overrides
-    //motorpwmlimit = 2000; //upper limit motor pwm value, doesnt do anything over 1900
+    motorpwmlimit = 1900; //upper limit motor pwm value, doesnt do anything over 1900
     timelimitrun = 7200; //upper time limit (in seconds)
-    velocityTargetLimit = 30;//upper speed limit for velocityTarget
+    velocityTargetLimit = 30;//upper speed limit for velocityTarget, unattainable if above 24.5 by sensor. realistically, unknown limit at this time with the titan 5000 series
+    //motorRampSlope = 500; //if this value is small, the motor ramp is fast, if it is large it is slow. a gentlr speed seems to be about 50 ms. used in state machine
     //end debug overrides
     wimbdyDebug = 1;
     delay(2000);
@@ -694,7 +695,7 @@ void loop()
           lcd.setCursor(0, 2);
           lcd.print("new trial in:       "); //pos 6
           lcd.setCursor(0, 3);
-          lcd.print("5 seconds.          ");
+          lcd.print("10 seconds.          ");
           lcd.setCursor(10, 3); //begin overwriting the " " on last line from left to right with "." every second (makes it look slick without much effort, hey?)
           delay (1000);
           lcd.print(".");
@@ -705,6 +706,15 @@ void loop()
           delay (1000);
           lcd.print(".");
           delay(1000);
+          lcd.print(".");
+          delay (1000);
+          lcd.print(".");
+          delay (1000);
+          lcd.print(".");
+          delay (1000);
+          lcd.print(".");
+          delay(1000);
+          lcd.print(".");
         }
 
         //delay(100000); // debug delay to stop it from resetting, normally comment out
@@ -1415,7 +1425,7 @@ void liveAdjustV() {//dynamic live adjust v
   }
   if (encoder_pulse == 1) {
     //encoder logic block
-    if (velocityTarget < 10) { //limited at 10 by current motor, 24 by anemometer
+    if (velocityTarget < velocityTargetLimit) { //limited at 10 by current motor, 24 by anemometer
       if (encoder_CW == 1) { //increase digit
 
         velocityTarget = (velocityTarget + 1);
@@ -1760,19 +1770,23 @@ void motorGovernor() {
     motorRampSlopePrevious = millis(); // first thing to do is updating the snapshot of time
     // time for timed action
 
-    if (currentVelocity < velocityTarget) {
+    if ((currentVelocity < velocityTarget) && (motorTarget < motorpwmlimit)) {
       motorTarget = motorTarget + 10; // where 10 is the constant, or P term. these are in pulses, not motor percents, because theyre smaller.
       //motorRamp(); //execute the change
-      motorGo(motorTarget); //testing to see if this is faster than ramping, IE no lag
+      //motorGo(motorTarget); //testing to see if this is faster than ramping, IE no lag
     }
     if (currentVelocity > velocityTarget) {
       motorTarget = motorTarget - 10;
       //motorRamp(); //execute the change
-      motorGo(motorTarget);
+      
     }
+    motorGo(motorTarget);
   }
 }
 
+//two governors??
+
+/**
 void motorRamp() { //sends motor from current speed to target speed at ramp constant speed, adjust ramp constant to increase or decrease motor slope, will need state machines to fully optimize. Laggy?
   if (motorTarget > motorCurrent) {
     //Serial.println("Ramping UP");
@@ -1780,7 +1794,13 @@ void motorRamp() { //sends motor from current speed to target speed at ramp cons
     if (millis() - motorRampSlopePrevious >= motorRampSlope) { //state machine to control the motor, will only update motor if enough time has elapsed since the last adjustment. This governs the governor
       motorRampSlopePrevious = millis(); // first thing to do is updating the snapshot of time
       // time for timed action
+      if (motorTarget < motorpwmlimit) { //must add this extra check or ESC gets unhappy with out of range values and shuts down
       motorGo(motorTarget);
+      }
+      else {
+        motorTarget = motorpwmlimit;
+      }
+      
       //Serial.print(i);
       //motorCurrent = i;
     }
@@ -1814,6 +1834,7 @@ void motorRamp() { //sends motor from current speed to target speed at ramp cons
     //}
   }
 } //end motorRamp
+*/
 
 int motorGo(int motorCommand) { //spin motor at motorCommand pulse rate
   motor.writeMicroseconds(motorCommand);
@@ -5045,7 +5066,7 @@ void displayUpdate() { //this is a very very long function, it is responsible fo
 
   if (active == 1) {
     if (run_interactive == 0) { //the run menu display update conditions
-      //lcd.clear();
+      lcd.clear(); //this was previosuly commented out but if it isnt in, the screen will aquire stale characters
       runMenu();
     }//end run menu display
     if ((run_interactive == 1) && (sensorstats_interactive == 0) && (liveadjustv_interactive == 0)) { //switch into run_interactive only if none of the submenus of run_interactive are up
