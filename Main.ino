@@ -411,7 +411,7 @@ void setup()
   lcd.setCursor(0, 0);
   lcd.print("                    "); //print 20 spaces, effectively clears the line
   lcd.setCursor(0, 1);
-  lcd.print(" WindOS Version 1.1 ");
+  lcd.print(" WindOS Version 1.2 ");
   lcd.setCursor(0, 2);
   lcd.print(" By Kameron Markham ");
   lcd.setCursor(0, 3);
@@ -689,7 +689,7 @@ void loop()
         if (numTrials > 0) {
           lcd.clear();
           lcd.setCursor(0, 0);
-          lcd.print("Trial(s) complete.  ");
+          lcd.print(" Trial(s) complete. ");
           lcd.setCursor(0, 1);
           lcd.print("WindOS will run a   "); //data goes at pos 6
           lcd.setCursor(0, 2);
@@ -727,7 +727,7 @@ void loop()
         }
         if (numTrials == 0) {
           lcd.setCursor(0, 0);
-          lcd.print("Total runs completed");
+          lcd.print(" Trial(s) completed.");
           lcd.setCursor(0, 1);
           lcd.print("WindOS will reset in"); //data goes at pos 6
           lcd.setCursor(0, 2);
@@ -6546,7 +6546,7 @@ void mainMenu() {
     lcd.print("OK "); //if our aim is good, this plops right next to the state flag on the screen
   }
   if (anemfail_notfound == 0) { //if we print bad values it blows everything up with -255 values. clearly wrong but not displaying anything is better.
-    lcd.setCursor(3, 1);
+    lcd.setCursor(2, 1);
     lcd.print(String(cgAnem.temperature));
     lcd.print("C");
     lcd.setCursor(12, 0);
@@ -6742,18 +6742,19 @@ void runMenu() {
 
 void aboutDisplay() { //should be handled by the displayUpdate state machine so no need to worry here
   lcd.setCursor(0, 0);
-  lcd.print("WindOS V1.0         ");
+  lcd.print("WindOS V1.2         ");
   lcd.setCursor(0, 1);
-  lcd.print("Last Update: 2/28/23");
+  lcd.print("Last Update: 5/26/23");
   lcd.setCursor(0, 2);
   lcd.print("By Kameron Markham  ");
   lcd.setCursor(0, 3);
-  lcd.print("             >Back< "); //normally the >clickme< selector would be dynamic but here we're basically faking it to make it easier to program
-  while (digitalRead(ENC_SW) == LOW) {//this is not as nice ui wise but it prevents stalling the whole program
+  lcd.print("bit.ly/Gale-WindOS  "); //normally the >clickme< selector would be dynamic but here we're basically faking it to make it easier to program
+  //while (digitalRead(ENC_SW) == LOW) {//this is not as nice ui wise but it prevents stalling the whole program
+    delay(7500); //auto-exit after 7.5 seconds. for some reason, exiting on button press is sketchy
     aboutMenu = 0;
     delay(clickDelay);
     displayUpdate();
-  }
+  //}
 }
 
 
