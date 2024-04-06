@@ -1,3 +1,5 @@
+//WindOS Version 1.3, 4/5/24, by Kameron Markham
+
 #include <cgAnem.h>
 #include <Arduino.h>//base arduino library (probably not needed)
 #include <Wire.h>//i2c transmission library
@@ -258,6 +260,9 @@ bool sensorSelectComplete = 0;
 bool baroyes = 1; //by defualt, barometer is selected. modified by sensor select
 bool loadcellyes = 1; //by default, load cell is selected
 
+//reset flags for held button
+bool heldResetFirstRun = 1; //by default, it is the first run, until we set it to not be.
+
 //delays and other timing params
 int clickDelay = 225; //delay after click to next screen in ms, this is a real delay because user needs time to have their thumb bounce off the switch
 long updateDelay = 1000; //main menu or run menu update pulse delay. since wind tunnel is multitasking, this is a state machine span parameter
@@ -268,6 +273,7 @@ long motorRampSlope = 500; //if this value is small, the motor ramp is fast, if 
 unsigned long previousTime = 0; //state machine time storage variable, unsigned because it lags millis(); by 1000 ms steps
 unsigned long previousTime2 = 0; //needed another one
 unsigned long previousTime3 = 0;
+unsigned long previousTimeReset = 0; //this is for held button reset
 unsigned long runTimeTickerPrevious = 0; //this is for the countdown state machine for the runTime clock when showing the run menu
 unsigned long motorRampSlopePrevious = 0; //tracked in the state machine to determine when the next motor ramp step should be
 unsigned long runStartMillis = 0; //this tracks the milli time at sensor dump init. this is needed for offset for accurate time in sensordumper
@@ -411,7 +417,7 @@ void setup()
   lcd.setCursor(0, 0);
   lcd.print("                    "); //print 20 spaces, effectively clears the line
   lcd.setCursor(0, 1);
-  lcd.print(" WindOS Version 1.2 ");
+  lcd.print(" WindOS Version 1.3 ");
   lcd.setCursor(0, 2);
   lcd.print(" By Kameron Markham ");
   lcd.setCursor(0, 3);
@@ -481,6 +487,20 @@ void loop()
   //end encoder block
 
   if (active == 0) {//this is all the main stuff. run stuff needs this flag set to 1
+
+    /** reset falsely triggers when trying to set up a run, disabled for now
+    //reset via held button only when wind tunnel is not active, and only if button remains held for longer than 5 seconds
+    if ((digitalRead(ENC_SW) == LOW) && (heldResetFirstRun == 1)) { //start the reset timer
+      heldResetFirstRun = 0;
+      previousTimeReset = millis();
+    }
+    if ((digitalRead(ENC_SW) == HIGH) && (heldResetFirstRun == 0)) { //reset cancel early (button let go)
+      heldResetFirstRun = 1; //reset the control flag to allow timer to restart
+    }
+    if ((digitalRead(ENC_SW) == LOW) && (heldResetFirstRun == 0) && (previousTimeReset <= (millis() - 5000))) { //final check, trigger reset if still held, not first run, and timer has elapsed
+      resetFunc();
+    }
+    */
 
     //if button is pressed while on the main menu, flip interactive variable to true
     if ((main_interactive == 0) && (startupComplete == 1) && (digitalRead(ENC_SW) == LOW)) { //the main menu display update conditions
@@ -1778,7 +1798,7 @@ void motorGovernor() {
     if (currentVelocity > velocityTarget) {
       motorTarget = motorTarget - 10;
       //motorRamp(); //execute the change
-      
+
     }
     motorGo(motorTarget);
   }
@@ -1787,7 +1807,7 @@ void motorGovernor() {
 //two governors??
 
 /**
-void motorRamp() { //sends motor from current speed to target speed at ramp constant speed, adjust ramp constant to increase or decrease motor slope, will need state machines to fully optimize. Laggy?
+  void motorRamp() { //sends motor from current speed to target speed at ramp constant speed, adjust ramp constant to increase or decrease motor slope, will need state machines to fully optimize. Laggy?
   if (motorTarget > motorCurrent) {
     //Serial.println("Ramping UP");
     //for (int i = motorCurrent; i < motorpwmlimit; i++) {//ramp up
@@ -1800,7 +1820,7 @@ void motorRamp() { //sends motor from current speed to target speed at ramp cons
       else {
         motorTarget = motorpwmlimit;
       }
-      
+
       //Serial.print(i);
       //motorCurrent = i;
     }
@@ -1833,7 +1853,7 @@ void motorRamp() { //sends motor from current speed to target speed at ramp cons
     //motorCurrent = i;
     //}
   }
-} //end motorRamp
+  } //end motorRamp
 */
 
 int motorGo(int motorCommand) { //spin motor at motorCommand pulse rate
@@ -1865,10 +1885,6 @@ void sensorDumper() {
   }
 
   //now baro0 - baro7 should have values
-  if (loadcellyes == 1) { //if user has asked for load cell data...
-    loadCell1Reading = LoadCell_1.get_units(); //unlike loadCellGo, we use this to change the direction of the vector to have positive force be up instead of down
-    loadCell2Reading = LoadCell_2.get_units(); //unlike loadCellGo, we use this to change the direction of the vector to have positive force be up instead of down
-  }
 
   if (baroyes == 0) { //if user has asked for no baro data...
     baro0 = 0;
@@ -1878,10 +1894,6 @@ void sensorDumper() {
     baro4 = 0;
     baro5 = 0;
     baro6 = 0;
-  }
-  if (loadcellyes == 0) { //if user has asked for no load cell data
-    loadCell1Reading = 0;
-    loadCell2Reading = 0;
   }
 
   //String(cgAnem.airflowRate) //we can use these directly in the prints
@@ -1917,16 +1929,21 @@ void sensorDumper() {
   Serial.print(",");
   Serial.print(String(cgAnem.temperature));
   Serial.print(",");
-  Serial.print(loadCell1Reading);
-  Serial.print(",");
-  Serial.print(loadCell2Reading);
-  Serial.print(",");
+  if (loadcellyes == 1) { //if user has asked for load cell data...
+    Serial.print(LoadCell_1.get_units(), 2); //extra precision by asking for , 2 in the serial print
+    Serial.print(",");
+    Serial.print(LoadCell_2.get_units(), 2); //ditto
+    Serial.print(",");
+  }
+  if (loadcellyes == 0) {//if user has NOT asked for load cell data, we must still satisfy the data header...
+    Serial.print("0");
+    Serial.print(",");
+    Serial.print("0");
+    Serial.print(",");
+  }
   Serial.print(float(((float(motorTarget) - 1200) / 700) * 100)); //prints motor percentage (converts from PWM)
   Serial.println();//line feed because we're done printing values
 }
-
-
-
 
 void anemStatsDisplay() {
   if (anemStatsInteractiveFirstRun == 1) {
@@ -5019,7 +5036,9 @@ void baroStatsMenuUserInput() { //suuuuuper long
 } //end barostatInput
 
 void displayUpdate() { //this is a very very long function, it is responsible for displaying the entire UI and every submenu though so it is understandable. The pre-main errors are handled seperately once per boot
-  
+
+
+
   /** here follows a standard display write. this is how we update the display. remember, you get 20 characters per line
     lcd.setCursor(0, 0);
     lcd.print("");
@@ -6742,18 +6761,18 @@ void runMenu() {
 
 void aboutDisplay() { //should be handled by the displayUpdate state machine so no need to worry here
   lcd.setCursor(0, 0);
-  lcd.print("WindOS V1.2         ");
+  lcd.print("WindOS V1.3         ");
   lcd.setCursor(0, 1);
-  lcd.print("Last Update: 5/26/23");
+  lcd.print("Last Update: 4/ 5/24");
   lcd.setCursor(0, 2);
   lcd.print("By Kameron Markham  ");
   lcd.setCursor(0, 3);
   lcd.print("bit.ly/Gale-WindOS  "); //normally the >clickme< selector would be dynamic but here we're basically faking it to make it easier to program
   //while (digitalRead(ENC_SW) == LOW) {//this is not as nice ui wise but it prevents stalling the whole program
-    delay(7500); //auto-exit after 7.5 seconds. for some reason, exiting on button press is sketchy
-    aboutMenu = 0;
-    delay(clickDelay);
-    displayUpdate();
+  delay(7500); //auto-exit after 7.5 seconds. for some reason, exiting on button press is sketchy
+  aboutMenu = 0;
+  delay(clickDelay);
+  displayUpdate();
   //}
 }
 
