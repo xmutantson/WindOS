@@ -133,7 +133,11 @@ public:
   bool missingBytes = false;
   int requests = 0;
   void setTimeout(unsigned long value) { streamTimeout = value; }
-  int requestFrom(uint8_t, int n) { ++requests; return missingBytes ? 0 : n; }
+  // Match AVR Wire 1.8.6 overloads so mixed argument types fail compilation.
+  uint8_t requestFrom(uint8_t, uint8_t n) { ++requests; return missingBytes ? 0 : n; }
+  uint8_t requestFrom(int address, int n) {
+    return requestFrom(uint8_t(address), uint8_t(n));
+  }
   size_t readBytes(uint8_t *out, size_t n) {
     if (missingBytes) { delay(streamTimeout); return 0; }
     if (n) *out = 0;

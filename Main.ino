@@ -415,7 +415,7 @@ void updateAirflow() {
   Wire.beginTransmission(ANEM_I2C_ADDR);
   Wire.write(i2c_reg_STATUS);
   const bool transportReady = Wire.endTransmission(false) == 0 &&
-                              Wire.requestFrom(uint8_t(ANEM_I2C_ADDR), 1) == 1;
+                              Wire.requestFrom(uint8_t(ANEM_I2C_ADDR), uint8_t(1)) == 1;
   const bool updated = transportReady && cgAnem.data_update();
   // CG Anem 1.0.3 reports a failed status read as "steady". Require a
   // successful explicit status read before accepting a fresh measurement.
