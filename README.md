@@ -94,15 +94,22 @@ Arduino installation, serial connection, or hardware are used:
 ```text
 python tests/run_tests.py
 python tests/run_tests.py --syntax-only
+python tests/run_driver_tests.py  # requires the locally staged pinned CG Anem library
 python tests/run_tests.py --cxx /path/to/g++
 ```
 
 The runner compiles the actual sketch with mock peripherals and Arduino-style
 function declarations. Core checks cover bounds, calibration records, deadlines,
-and rollover. The 21 isolated sketch cases cover boot, stop acknowledgement,
+and rollover. The 27 isolated sketch cases cover boot, stop acknowledgement,
 arming and running cancellation, airflow faults/status-read failures/timeouts,
 trial sequencing, pressure channels, load readiness, calibration persistence,
-CSV structure, and encoder direction. Failed checks print to stderr and exit
+CSV structure, and encoder direction. Deadline cases cover acquisition overruns,
+direct motor commands, and clock rollover. The separate pinned-driver test checks
+disconnects at each of seven register requests. A status probe rejects short reads
+before acquisition; the driver's subsequent Stream reads each have a 25 ms timeout,
+separate from Wire's 25,000 us bus timeout. Trial completion is checked before and
+after acquisition and again before actuator updates. These are host timing models,
+not physical stop-latency measurements. Failed checks print to stderr and exit
 nonzero without assertion crash dialogs. Compiler runtime DLLs take precedence
 over unrelated Python-distribution DLLs in child-process PATH.
 
@@ -150,7 +157,7 @@ installed core/toolchain directory, `ARDUINO_DIRECTORIES_DOWNLOADS` and
 `ARDUINO_DIRECTORIES_USER` to owned local directories, and
 `ARDUINO_BUILD_CACHE_PATH` to a local cache when avoiding default system locations.
 
-The compile on 2026-10-02 used 56,314/253,952 flash bytes and 3,494/8,192 static SRAM
+The compile on 2026-10-02 used 56,582/253,952 flash bytes and 3,494/8,192 static SRAM
 bytes, leaving 4,698 bytes for stack/heap. These are linker figures, not measured
 worst-case runtime memory use. `--warnings all` reports existing firmware warnings
 (unused diagnostic variables, signed timing comparisons, and condition precedence)

@@ -126,7 +126,21 @@ public:
   }
 };
 
-class MockWire {
+// Kept in a base so external driver probes can override transport behavior.
+class MockWireTransport {
+public:
+  unsigned long streamTimeout = 1000;
+  bool missingBytes = false;
+  int requests = 0;
+  void setTimeout(unsigned long value) { streamTimeout = value; }
+  int requestFrom(uint8_t, int n) { ++requests; return missingBytes ? 0 : n; }
+  size_t readBytes(uint8_t *out, size_t n) {
+    if (missingBytes) { delay(streamTimeout); return 0; }
+    if (n) *out = 0;
+    return n;
+  }
+};
+class MockWire : public MockWireTransport {
 public:
   bool selectionFails = false;
   bool failAll = false;
@@ -162,6 +176,9 @@ public:
   bool unsteadyProcess = false;
   bool statusReadOK = true;
   bool timeoutOnUpdate = false;
+  bool disappearDuringUpdate = false;
+  unsigned long updateDelayMs = 0;
+  int updateCalls = 0;
   float airflowRate = 0;
   float temperature = 20;
   float airConsumption = 0;
@@ -169,6 +186,15 @@ public:
   explicit CG_Anem(uint8_t) {}
   bool init() { return initOK; }
   bool data_update() {
+    ++updateCalls;
+    delay(updateDelayMs);
+    if (disappearDuringUpdate) {
+      Wire.missingBytes = true;
+      uint8_t ignored;
+      for (int i = 0; i < 4; ++i) Wire.readBytes(&ignored, 1);
+      airflowRate = -255;
+      return false;
+    }
     if (timeoutOnUpdate) Wire.timeoutFlag = true;
     return updateOK;
   }
@@ -191,6 +217,7 @@ public:
   bool beginOK = true;
   bool eventOK = true;
   bool timeoutOnRead = false;
+  unsigned long acquisitionDelayMs = 0;
   float pressure = 1000.25f;
   int beginCalls = 0;
   int eventCalls = 0;
@@ -201,7 +228,7 @@ public:
     return beginOK;
   }
   bool getEvent(sensors_event_t *event) {
-    ++eventCalls;
+    ++eventCalls; delay(acquisitionDelayMs);
     if (mockBmpCalibratedId != id) ++mockBmpWrongCalibrationReads;
     event->pressure = pressure;
     if (timeoutOnRead) Wire.timeoutFlag = true;

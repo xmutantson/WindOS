@@ -404,14 +404,23 @@ void acknowledgeStop() {
 }
 
 void updateAirflow() {
+  // Wire's bus timeout does not bound Stream::readBytes in CG Anem 1.0.3.
+  // Bound each driver stream read even if a device disappears mid-update.
+  Wire.setTimeout(25);
 #if defined(WIRE_HAS_TIMEOUT)
   Wire.clearWireTimeoutFlag();
 #endif
-  const bool updated = cgAnem.data_update();
+  // A short request is a transport failure, not a reason to wait for bytes.
+  // Probe the status register before entering the driver's multi-read update.
+  Wire.beginTransmission(ANEM_I2C_ADDR);
+  Wire.write(i2c_reg_STATUS);
+  const bool transportReady = Wire.endTransmission(false) == 0 &&
+                              Wire.requestFrom(uint8_t(ANEM_I2C_ADDR), 1) == 1;
+  const bool updated = transportReady && cgAnem.data_update();
   // CG Anem 1.0.3 reports a failed status read as "steady". Require a
   // successful explicit status read before accepting a fresh measurement.
   uint8_t status = 0;
-  bool transportOK = cgAnem.register_read_byte(i2c_reg_STATUS, &status);
+  bool transportOK = transportReady && cgAnem.register_read_byte(i2c_reg_STATUS, &status);
 #if defined(WIRE_HAS_TIMEOUT)
   transportOK = transportOK && !Wire.getWireTimeoutFlag();
 #endif
@@ -435,31 +444,38 @@ void beginTrial() {
   motorGo(motorTarget);
   sensorDumperMillis = 0;
   sensorDumper(); // Include t=0 even for the shortest trial.
+  if (finishExpiredTrial()) return;
   displayUpdate();
 }
 
+bool finishExpiredTrial() {
+  if (!motorInitComplete || !trialClock.complete(uint32_t(millis()))) return false;
+  motor.writeMicroseconds(windos::kStopPulseUs);
+  motorInitComplete = false;
+  runTime = 0;
+  --numTrials;
+  if (numTrials == 0) stopRun("Trials complete");
+  else {
+    ++numTrialsObserved;
+    betweenTrials = true;
+    phaseStartedAt = uint32_t(millis());
+    phaseButtonReleased = digitalRead(ENC_SW) == HIGH;
+    lcd.clear(); lcd.print("Next trial in 10s");
+    lcd.setCursor(0, 3); lcd.print("Click to abort");
+  }
+  return true;
+}
+
 void serviceTrial() {
+  if (finishExpiredTrial()) return;
   const uint32_t now = uint32_t(millis());
   runTime = int(trialClock.remainingSeconds(now));
-  if (trialClock.complete(now)) {
-    motor.writeMicroseconds(windos::kStopPulseUs);
-    motorInitComplete = false;
-    --numTrials;
-    if (numTrials == 0) stopRun("Trials complete");
-    else {
-      ++numTrialsObserved;
-      betweenTrials = true;
-      phaseStartedAt = now;
-      phaseButtonReleased = digitalRead(ENC_SW) == HIGH;
-      lcd.clear(); lcd.print("Next trial in 10s");
-      lcd.setCursor(0, 3); lcd.print("Click to abort");
-    }
-    return;
-  }
   if (uint32_t(now - uint32_t(previousTime3)) >= sensorDumperDelay) {
     previousTime3 = now;
     sensorDumperMillis = trialClock.elapsedMs(now);
     sensorDumper();
+    // Pressure acquisition and serial output can cross the trial deadline.
+    finishExpiredTrial();
   }
 }
 
@@ -471,6 +487,12 @@ void setup()
   Serial.begin(115200);
 
   //lcd.print("Hello World!!!!!!!!!abcdefghijklmnop----@@@@@@@@@@@@@@#######");
+
+  Wire.begin();
+  Wire.setTimeout(25);
+#if defined(WIRE_HAS_TIMEOUT)
+  Wire.setWireTimeout(25000, true);
+#endif
 
   //sensor init block
   //anemometer init
@@ -614,8 +636,11 @@ void loop()
   //delay(1000); //enable to make it think slower for sane debugging at loop speed
   //Serial.println(millis()); //this will allow us to calculate the loop speed, but makes the thing horrible to use and lags everything out
   //end debug
-  updateAirflow();
   if (stopLatched) { acknowledgeStop(); return; }
+  // Service a known deadline before starting another sensor transaction.
+  if (finishExpiredTrial()) return;
+  updateAirflow();
+  if (finishExpiredTrial()) return;
   if ((motorArming || motorInitComplete || betweenTrials) &&
       !airflowSample.fresh(uint32_t(millis()))) {
     stopRun("Airflow fault"); return;
@@ -1772,7 +1797,7 @@ void trialDataEntry() { //needs to be shortcut into the loop
 
 //begin motor governor functions
 void motorGovernor() {
-  if (!motorInitComplete || stopLatched) return;
+  if (!motorInitComplete || stopLatched || finishExpiredTrial()) return;
   if (!airflowSample.fresh(uint32_t(millis()))) { stopRun("Airflow fault"); return; }
   // Failed/unsteady updates cannot increase throttle within the freshness grace.
   if (!anemUpdateReady) return;
@@ -1787,6 +1812,8 @@ void motorGovernor() {
 }
 
 void motorGo(int requested) {
+  // Final gate also covers direct commands and time spent in menus/acquisition.
+  if (finishExpiredTrial()) return;
   if (stopLatched || !motorInitComplete || !airflowSample.fresh(uint32_t(millis()))) {
     motor.writeMicroseconds(windos::kStopPulseUs); return;
   }

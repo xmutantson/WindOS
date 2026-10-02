@@ -158,6 +158,7 @@ static void start_refused() {
 }
 static void governor_bounds() {
   configuredRun();
+  originalRunTime = 3600; // Keep the bounds exercise inside its trial deadline.
   beginTrial();
   motorpwmlimit = 1700;
   motorGo(32767); CHECK(motor.lastPulse == 1700);
@@ -177,6 +178,53 @@ static void governor_bounds() {
   readyAirflow(-255);
   motorGo(1700);
   CHECK(motor.lastPulse == windos::kStopPulseUs);
+}
+static void deadline_during_pressure() {
+  configuredRun(); beginTrial(); motorGo(1500);
+  baroyes = true;
+  Adafruit_BMP085_Unified *sensors[] = {&bmp1,&bmp2,&bmp3,&bmp4,&bmp5,&bmp6,&bmp7};
+  for (int i = 0; i < 7; ++i) {
+    pressureInitialized[i] = true; sensors[i]->acquisitionDelayMs = 31;
+  }
+  mockMillis = 14900; readyAirflow();
+  const size_t before = motor.pulses.size();
+  loop(); assertStopped();
+  for (size_t i = before; i < motor.pulses.size(); ++i)
+    CHECK(motor.pulses[i] == windos::kStopPulseUs);
+}
+static void deadline_before_acquisition() {
+  configuredRun(); beginTrial(); motorGo(1500);
+  const int requests = Wire.requests, updates = cgAnem.updateCalls;
+  mockMillis = 15000;
+  loop(); assertStopped();
+  CHECK(Wire.requests == requests && cgAnem.updateCalls == updates);
+}
+static void deadline_during_airflow() {
+  mockMillis = 0xfffffff0U;
+  configuredRun(2); beginTrial(); motorGo(1500);
+  mockMillis += 14990;
+  cgAnem.updateDelayMs = 25;
+  loop();
+  CHECK(betweenTrials && numTrials == 1 && motor.lastPulse == windos::kStopPulseUs);
+  CHECK(!motorInitComplete);
+}
+static void deadline_direct_motor_command() {
+  configuredRun(); beginTrial();
+  mockMillis = 15000; readyAirflow();
+  motorGo(1700); assertStopped();
+}
+static void missing_airflow_bytes() {
+  configuredRun(); beginTrial(); motorGo(1500);
+  Wire.missingBytes = true;
+  const uint32_t start = mockMillis;
+  loop(); assertStopped(); CHECK(mockMillis - start == 0);
+}
+static void airflow_disconnect_during_update() {
+  configuredRun(); beginTrial(); motorGo(1500);
+  cgAnem.disappearDuringUpdate = true;
+  const uint32_t start = mockMillis;
+  loop(); assertStopped();
+  CHECK(Wire.streamTimeout == 25 && mockMillis - start == 100);
 }
 static void trial_sequence() {
   configuredRun(2);
@@ -377,6 +425,9 @@ struct Case { const char *name; void (*run)(); };
 static const Case cases[] = {
   CASE(boot), CASE(stop_latch), CASE(arming_abort), CASE(running_abort), CASE(arming_sensor_fault), CASE(arming_clock),
   CASE(airflow_faults), CASE(airflow_transport_timeout), CASE(invalid_airflow), CASE(start_refused), CASE(governor_bounds),
+  CASE(deadline_during_pressure), CASE(deadline_before_acquisition),
+  CASE(deadline_during_airflow), CASE(deadline_direct_motor_command),
+  CASE(missing_airflow_bytes), CASE(airflow_disconnect_during_update),
   CASE(trial_sequence), CASE(between_abort), CASE(pressure_channels), CASE(load_availability),
   CASE(calibration_persistence), CASE(calibration_capture), CASE(calibration_success),
   CASE(calibration_timeout), CASE(csv_contract), CASE(encoder_direction)
