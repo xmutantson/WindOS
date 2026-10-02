@@ -1,0 +1,38 @@
+[
+  {
+    "name": "HX711 Arduino Library",
+    "version": "0.7.5",
+    "url": "https://downloads.arduino.cc/libraries/github.com/bogde/HX711_Arduino_Library-0.7.5.zip",
+    "sha256": "11a72d1d462a0306e8e0c5cf33d215cefded2e9c9b7ce05e1f1d2d42b47291f6"
+  },
+  {
+    "name": "Servo",
+    "version": "1.2.2",
+    "url": "https://downloads.arduino.cc/libraries/github.com/arduino-libraries/Servo-1.2.2.zip",
+    "sha256": "60850b4c644aa4239706fa50ca09a49c99fb98b0e0f2fb84b30022b82428908b"
+  },
+  {
+    "name": "Adafruit Unified Sensor",
+    "version": "1.1.15",
+    "url": "https://downloads.arduino.cc/libraries/github.com/adafruit/Adafruit_Unified_Sensor-1.1.15.zip",
+    "sha256": "d64cdec0b817535f568fc3b8b8d44e7e097749f5ab8040aea573f412a3cbaec6"
+  },
+  {
+    "name": "Adafruit BMP085 Unified",
+    "version": "1.1.3",
+    "url": "https://downloads.arduino.cc/libraries/github.com/adafruit/Adafruit_BMP085_Unified-1.1.3.zip",
+    "sha256": "def2e413bf4d87f47b096e97515b47b6a6a746c3c5179237fd130224c86ebac6"
+  },
+  {
+    "name": "ClimateGuard CG Anem",
+    "version": "1.0.3",
+    "url": "https://downloads.arduino.cc/libraries/github.com/climateguard/ClimateGuard_CG_Anem-1.0.3.zip",
+    "sha256": "096b29ec93c8fa23371d1bf509ed66fc77f4a55d4a8664d9dfdf4dbbcd0ae21d"
+  },
+  {
+    "name": "LiquidCrystal",
+    "version": "1.0.7",
+    "url": "https://downloads.arduino.cc/libraries/github.com/arduino-libraries/LiquidCrystal-1.0.7.zip",
+    "sha256": "f7b14c42afbbdcfbe66073e6ef1e4cbaa03f5d11f52f9ab91c916b6ccac38434"
+  }
+]
