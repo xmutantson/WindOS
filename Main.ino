@@ -8,6 +8,7 @@
 #include <Adafruit_Sensor.h>//adafruit library, common for all unified sensors
 #include <Adafruit_BMP085_U.h>//barometer
 #include <EEPROM.h> //this is used to store values when running load cell calibration
+#include "WindOSCore.h"
 #include <Servo.h> //for the motor, need to use this for PWM output
 
 #define ENC_A 3 //encoder A, Green, pin 3
@@ -23,7 +24,7 @@
 #define Load2_CLK 9
 
 //i2c sensor definitions
-ClimateGuard_Anem cgAnem(ANEM_I2C_ADDR); //Anemometer Definition
+CG_Anem cgAnem(ANEM_I2C_ADDR); //Anemometer Definition
 Adafruit_BMP085_Unified bmp1 = Adafruit_BMP085_Unified(1); //all the barometers
 Adafruit_BMP085_Unified bmp2 = Adafruit_BMP085_Unified(2);
 Adafruit_BMP085_Unified bmp3 = Adafruit_BMP085_Unified(3);
@@ -42,14 +43,14 @@ int motorCurrent = 0; //lags target by ramp speed* loops needed to equal target
 bool motorInitComplete = 0; //locks out motorInit after it's been run.
 
 //barometer readings need to be initalized, as well as whatever averaging we do, as well as barometer select, because that needs to be specified before you request sensor data
-int baroAvg = 0; //average of actual sensor data
-int baro0 = 0; //actual sensor data
-int baro1 = 0;
-int baro2 = 0;
-int baro3 = 0;
-int baro4 = 0;
-int baro5 = 0;
-int baro6 = 0;
+float baroAvg = 0; //average of actual sensor data
+float baro0 = 0; //actual sensor data
+float baro1 = 0;
+float baro2 = 0;
+float baro3 = 0;
+float baro4 = 0;
+float baro5 = 0;
+float baro6 = 0;
 uint8_t baroSelect = 0; //select from 0-6 to pick a barometer. always do this first before calling baroRead
 
 //Load Cell Amplifiers
@@ -60,8 +61,8 @@ float calibration_factor_1 = -1200; //these should be overwritten with eeprom re
 float calibration_factor_2 = -1200;
 long loadCellGo1Reading = 0; //this is the actual reading of the load cell used to drive the mass toward user-entered mass to calibrate load cells
 long loadCellGo2Reading = 0; //same for 2
-long loadCell1Reading = 0; //actual reading, note the force vector points opposite the load cell arrow
-long loadCell2Reading = 0;
+float loadCell1Reading = NAN; //actual reading, note the force vector points opposite the load cell arrow
+float loadCell2Reading = NAN;
 uint8_t loadcellprecision1 = 0; //this is the speed of adjustment modifier. goes 0 for inc. 1000, 1 = 100, 2 = 10, 3 = satified
 uint8_t loadcellprecision2 = 0;
 
@@ -69,8 +70,7 @@ uint8_t loadcellprecision2 = 0;
 bool encoder_CCW = 0; //this flag gets raised when the rotation changes, and when checked, should be reset if it's 1.
 bool encoder_CW = 0; //this flag gets raised when the rotation changes, and when checked, should be reset if it's 1.
 bool encoder_pulse = 0; //this is used in interactive menus to tell if the encoder has pulsed either direction to trigger a display update if true
-static uint8_t counter = 1;      //this variable will be changed by encoder input
-static uint8_t oldcounter = 1;  //for comaprison of counter to check if it's increasing or decreasing. used in read_encoder_rot();
+// Direction is taken directly from each signed encoder event.
 
 const int rs = 53, en = 51, d4 = 49, d5 = 47, d6 = 45, d7 = 43;
 LiquidCrystal lcd(rs, en, d4, d5, d6, d7); //for the *lcd.xyz();* commands later
@@ -274,11 +274,8 @@ unsigned long previousTime = 0; //state machine time storage variable, unsigned 
 unsigned long previousTime2 = 0; //needed another one
 unsigned long previousTime3 = 0;
 unsigned long previousTimeReset = 0; //this is for held button reset
-unsigned long runTimeTickerPrevious = 0; //this is for the countdown state machine for the runTime clock when showing the run menu
-unsigned long motorRampSlopePrevious = 0; //tracked in the state machine to determine when the next motor ramp step should be
-unsigned long runStartMillis = 0; //this tracks the milli time at sensor dump init. this is needed for offset for accurate time in sensordumper
-unsigned long sensorDumperMillis = 0; //this is needed to be able to "pause" millis while in submenus, so as to hide the time discrepancy from the csv log
-unsigned long sensorResumeMillis = 0; //this is the time discrepancy between the sensor dumper time and the real time, will be corrected when exiting the interactive menu
+unsigned long motorRampSlopePrevious = 0;
+unsigned long sensorDumperMillis = 0;
 unsigned long sensorDumperDelay = 1000; //this delays the sensor dumper loop to allow the microcontroller not to choke
 
 //Sensor Timings
@@ -300,13 +297,202 @@ int timelimitrun = 300; //upper time limit (in seconds)
 int velocityTargetLimit = 9;//upper speed limit for velocityTarget
 bool wimbdyDebug = 0; //debug flag, to be used to bring us out of research mode. enables diagnostic serial prints and other stuff
 
+// Control and acquisition state is independent of LCD navigation.
+windos::AirflowSample airflowSample;
+windos::TrialClock trialClock;
+bool anemUpdateReady = false;
+bool motorArming = false;
+bool betweenTrials = false;
+bool stopLatched = false;
+bool stopButtonReleased = false;
+bool phaseButtonReleased = false;
+bool calibrationCaptureActive = false;
+uint32_t calibrationStartedAt = 0;
+float calibrationSum = 0;
+uint8_t calibrationSamples = 0;
+uint32_t phaseStartedAt = 0;
+bool pressureInitialized[7] = {false};
+bool pressureValid[7] = {false};
+bool calibrationValid[2] = {false};
+bool loadCellZeroed[2] = {false};
+const int calibrationAddress[2] = {32, 48};
+
+bool tareLoadCell(HX711 &sensor) {
+  if (!sensor.is_ready()) return false;
+  sensor.tare(1);
+  loadCellZeroed[&sensor == &LoadCell_1 ? 0 : 1] = true;
+  return true;
+}
+
+float readLoadCell(HX711 &sensor) {
+  const uint8_t channel = &sensor == &LoadCell_1 ? 0 : 1;
+  if (!sensor.is_ready()) return NAN;
+  if (!loadCellZeroed[channel]) {
+    tareLoadCell(sensor);
+    return NAN; // The first ready sample establishes zero, not a measurement.
+  }
+  const float value = sensor.get_units(1);
+  return isfinite(value) ? value : NAN;
+}
+
+float displayLoadCell(HX711 &sensor) {
+  const float value = readLoadCell(sensor);
+  return calibrationValid[&sensor == &LoadCell_1 ? 0 : 1] ? value : NAN;
+}
+
+void printLoadCell(uint8_t channel, float value) {
+  if (!calibrationValid[channel]) lcd.print("CAL");
+  else if (!isfinite(value)) lcd.print("--");
+  else lcd.print(value, 2);
+}
+
+void loadCalibration(uint8_t channel, float &factor) {
+  windos::CalibrationRecord record;
+  EEPROM.get(calibrationAddress[channel], record);
+  calibrationValid[channel] = windos::validCalibration(record);
+  if (calibrationValid[channel]) factor = record.factor;
+}
+
+bool saveCalibration(uint8_t channel, float factor) {
+  if (!windos::validCalibrationFactor(factor)) return false;
+  const windos::CalibrationRecord record = windos::calibrationRecord(factor);
+  EEPROM.put(calibrationAddress[channel], record);
+  windos::CalibrationRecord verified;
+  EEPROM.get(calibrationAddress[channel], verified);
+  // A failed persistence attempt must not revoke a previously valid RAM scale.
+  // The caller replaces its factor only after this verification succeeds.
+  if (!windos::validCalibration(verified) || verified.factor != factor) return false;
+  calibrationValid[channel] = true;
+  return true;
+}
+
+void stopRun(const char *reason) {
+  motor.writeMicroseconds(windos::kStopPulseUs);
+  motorTarget = motorCurrent = windos::kIdlePulseUs;
+  active = motorArming = betweenTrials = motorInitComplete = false;
+  loadCellGo1Active = loadCellGo2Active = calibrationCaptureActive = false;
+  stopLatched = true;
+  stopButtonReleased = false;
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("Motor stopped");
+  lcd.setCursor(0, 1); lcd.print(reason);
+  lcd.setCursor(0, 3); lcd.print("Release, click: menu");
+}
+
+void acknowledgeStop() {
+  motor.writeMicroseconds(windos::kStopPulseUs);
+  if (digitalRead(ENC_SW) == HIGH) stopButtonReleased = true;
+  if (!stopButtonReleased || digitalRead(ENC_SW) != LOW) return;
+  active = main_interactive = run_interactive = false;
+  calibrationCaptureActive = loadCellGo1Active = loadCellGo2Active = false;
+  loadCellDataEntryComplete = false;
+  sensorstats_interactive = barostats_interactive = anemstats_interactive = false;
+  loadstats_interactive = liveadjustv_interactive = false;
+  serial_interactive = baud_interactive = calibrate_interactive = aboutMenu = false;
+  runDataEntryComplete = timeDataEntryComplete = veloDataEntryComplete = false;
+  trialDataEntryComplete = firstTrialComplete = warmupComplete = false;
+  sensorSelectBaro = sensorSelectBaroBegin = false;
+  sensorSelectLoadCell = sensorSelectLoadCellBegin = sensorSelectComplete = false;
+  baroyes = loadcellyes = true;
+  numTrials = numTrialsObserved = 1;
+  runTime = originalRunTime = velocityTarget = 0;
+  dataDumperFirstRun = true;
+  encoder_CW = encoder_CCW = encoder_pulse = false;
+  stopLatched = false;
+  delay(clickDelay);
+  displayUpdate(); // A separate Start action and setup are required to rearm.
+}
+
+void updateAirflow() {
+  // Wire's bus timeout does not bound Stream::readBytes in CG Anem 1.0.3.
+  // Bound each driver stream read even if a device disappears mid-update.
+  Wire.setTimeout(25);
+#if defined(WIRE_HAS_TIMEOUT)
+  Wire.clearWireTimeoutFlag();
+#endif
+  // A short request is a transport failure, not a reason to wait for bytes.
+  // Probe the status register before entering the driver's multi-read update.
+  Wire.beginTransmission(ANEM_I2C_ADDR);
+  Wire.write(i2c_reg_STATUS);
+  const bool transportReady = Wire.endTransmission(false) == 0 &&
+                              Wire.requestFrom(uint8_t(ANEM_I2C_ADDR), uint8_t(1)) == 1;
+  const bool updated = transportReady && cgAnem.data_update();
+  // CG Anem 1.0.3 reports a failed status read as "steady". Require a
+  // successful explicit status read before accepting a fresh measurement.
+  uint8_t status = 0;
+  bool transportOK = transportReady && cgAnem.register_read_byte(i2c_reg_STATUS, &status);
+#if defined(WIRE_HAS_TIMEOUT)
+  transportOK = transportOK && !Wire.getWireTimeoutFlag();
+#endif
+  anemUpdateReady = updated && transportOK && !(status & (1 << STUP));
+  airflowSample.observe(anemUpdateReady, transportOK ? cgAnem.airflowRate : NAN,
+                        uint32_t(millis()));
+}
+
+void beginTrial() {
+  if (!airflowSample.fresh(uint32_t(millis())) || !anemUpdateReady) {
+    stopRun("Airflow not ready"); return;
+  }
+  trialClock.start(uint32_t(millis()), uint32_t(originalRunTime));
+  previousTime3 = motorRampSlopePrevious = millis();
+  dataDumperFirstRun = true;
+  runTime = originalRunTime;
+  run_interactive = sensorstats_interactive = barostats_interactive = false;
+  anemstats_interactive = loadstats_interactive = liveadjustv_interactive = false;
+  motorInitComplete = true;
+  motorTarget = windos::kIdlePulseUs;
+  motorGo(motorTarget);
+  sensorDumperMillis = 0;
+  sensorDumper(); // Include t=0 even for the shortest trial.
+  if (finishExpiredTrial()) return;
+  displayUpdate();
+}
+
+bool finishExpiredTrial() {
+  if (!motorInitComplete || !trialClock.complete(uint32_t(millis()))) return false;
+  motor.writeMicroseconds(windos::kStopPulseUs);
+  motorInitComplete = false;
+  runTime = 0;
+  --numTrials;
+  if (numTrials == 0) stopRun("Trials complete");
+  else {
+    ++numTrialsObserved;
+    betweenTrials = true;
+    phaseStartedAt = uint32_t(millis());
+    phaseButtonReleased = digitalRead(ENC_SW) == HIGH;
+    lcd.clear(); lcd.print("Next trial in 10s");
+    lcd.setCursor(0, 3); lcd.print("Click to abort");
+  }
+  return true;
+}
+
+void serviceTrial() {
+  if (finishExpiredTrial()) return;
+  const uint32_t now = uint32_t(millis());
+  runTime = int(trialClock.remainingSeconds(now));
+  if (uint32_t(now - uint32_t(previousTime3)) >= sensorDumperDelay) {
+    previousTime3 = now;
+    sensorDumperMillis = trialClock.elapsedMs(now);
+    sensorDumper();
+    // Pressure acquisition and serial output can cross the trial deadline.
+    finishExpiredTrial();
+  }
+}
+
 void setup()
 {
-  motor.write(0); //keep the motor stopped DO NOT DELETE EVER
+  motor.attach(motorPin);
+  motor.writeMicroseconds(windos::kStopPulseUs); // Stop before initializing sensors.
   lcd.begin(20, 4);
   Serial.begin(115200);
 
   //lcd.print("Hello World!!!!!!!!!abcdefghijklmnop----@@@@@@@@@@@@@@#######");
+
+  Wire.begin();
+  Wire.setTimeout(25);
+#if defined(WIRE_HAS_TIMEOUT)
+  Wire.setWireTimeout(25000, true);
+#endif
 
   //sensor init block
   //anemometer init
@@ -316,11 +502,11 @@ void setup()
   {
     //Serial.println("Sensor successfully found");
   }
-  uint8_t sensorChipId = cgAnem.getChipId(); /*Returns chip id, default value: 0x11.*/
+  const uint8_t sensorChipId = cgAnem.getChipId(); /*Returns chip id, default value: 0x11.*/
   //Serial.print("Chip id: 0x");
   //Serial.println(sensorChipId, HEX);
 
-  uint8_t firmWareVer = cgAnem.getFirmwareVersion(); /*Returns firmware version.*/
+  const float firmWareVer = cgAnem.getFirmwareVersion(); /*Returns firmware version.*/
   //Serial.print("Firmware version: ");
   //Serial.println(firmWareVer);
   //Serial.println("-------------------------------------");
@@ -331,30 +517,25 @@ void setup()
 
   //anemometer init finished
   //load cell init
-  EEPROM.get(0, calibration_factor_1); //get eeprom values for calibration factor out of storage
-  EEPROM.get(8, calibration_factor_2);
+  loadCalibration(0, calibration_factor_1);
+  loadCalibration(1, calibration_factor_2);
 
   LoadCell_1.begin(Load1_DAT, Load1_CLK); //if there are short wires but no actual load cell amps connected this has lagged the program before as it tries to establish library comms with the devices
   LoadCell_1.set_scale(calibration_factor_1);
-  LoadCell_1.tare(); //Reset the LoadCell_1 to 0
+  tareLoadCell(LoadCell_1); //Reset the LoadCell_1 to 0
   LoadCell_2.begin(Load2_DAT, Load2_CLK);
   LoadCell_2.set_scale(calibration_factor_2);
-  LoadCell_2.tare(); //Reset the LoadCell_1 to 0
-
-  long zero_factor_1 = LoadCell_1.read_average(); //Get a baseline reading
-  //Serial.print("Zero factor_1: "); //This can be used to remove the need to tare the scale. Useful in permanent scale projects.
-  //Serial.println(zero_factor_1);
-
-  long zero_factor_2 = LoadCell_2.read_average(); //Get a baseline reading
-  //Serial.print("Zero factor_2: "); //This can be used to remove the need to tare the scale. Useful in permanent scale projects.
-  //Serial.println(zero_factor_2);
+  tareLoadCell(LoadCell_2); //Reset the LoadCell_1 to 0
 
   //Barometer init, will freeze program if missing
   Wire.begin();
+#if defined(WIRE_HAS_TIMEOUT)
+  Wire.setWireTimeout(25000, true);
+#endif
 
   /* Initialise the 1st sensor */
-  tcaselect(0); //if you're here because tcaselect was not declared in this scope theres a curlybracket problem somewhere... godspeed
-  if (!bmp1.begin())
+  pressureInitialized[0] = tcaselect(0) && bmp1.begin();
+  if (!pressureInitialized[0])
   {
     /* There was a problem detecting the bmp1085 ... check your connections */
     //Serial.print("Ooops, no bmp085 detected ... Check your wiring or I2C ADDR!");
@@ -362,8 +543,8 @@ void setup()
   }
 
   /* Initialise the 2nd sensor */
-  tcaselect(1);
-  if (!bmp2.begin())
+  pressureInitialized[1] = tcaselect(1) && bmp2.begin();
+  if (!pressureInitialized[1])
   {
     /* There was a problem detecting the bmp1085 ... check your connections */
     //Serial.print("Ooops, no bmp085 detected ... Check your wiring or I2C ADDR!");
@@ -371,40 +552,40 @@ void setup()
   }
 
   /* Initialise the 3rd sensor */
-  tcaselect(2);
-  if (!bmp3.begin())
+  pressureInitialized[2] = tcaselect(2) && bmp3.begin();
+  if (!pressureInitialized[2])
   {
     /* There was a problem detecting the bmp1085 ... check your connections */
     //Serial.print("Ooops, no bmp085 detected ... Check your wiring or I2C ADDR!");
     //while (1);
   }
   /* Initialise the 4th sensor */
-  tcaselect(3);
-  if (!bmp4.begin())
+  pressureInitialized[3] = tcaselect(3) && bmp4.begin();
+  if (!pressureInitialized[3])
   {
     /* There was a problem detecting the bmp1085 ... check your connections */
     //Serial.print("Ooops, no bmp085 detected ... Check your wiring or I2C ADDR!");
     //while (1);
   }
   /* Initialise the 5th sensor */
-  tcaselect(4);
-  if (!bmp5.begin())
+  pressureInitialized[4] = tcaselect(4) && bmp5.begin();
+  if (!pressureInitialized[4])
   {
     /* There was a problem detecting the bmp1085 ... check your connections */
     //Serial.print("Ooops, no bmp085 detected ... Check your wiring or I2C ADDR!");
     //while (1);
   }
   /* Initialise the 6th sensor */
-  tcaselect(5);
-  if (!bmp6.begin())
+  pressureInitialized[5] = tcaselect(5) && bmp6.begin();
+  if (!pressureInitialized[5])
   {
     /* There was a problem detecting the bmp1085 ... check your connections */
     //Serial.print("Ooops, no bmp085 detected ... Check your wiring or I2C ADDR!");
     //while (1);
   }
   /* Initialise the 7th sensor */
-  tcaselect(6);
-  if (!bmp7.begin())
+  pressureInitialized[6] = tcaselect(6) && bmp7.begin();
+  if (!pressureInitialized[6])
   {
     /* There was a problem detecting the bmp1085 ... check your connections */
     //Serial.print("Ooops, no bmp085 detected ... Check your wiring or I2C ADDR!");
@@ -423,7 +604,7 @@ void setup()
   lcd.setCursor(0, 3);
   //lcd.print("                    "); //print 20 spaces, effectively clears the line
 
-  motor.attach(motorPin); //setup the motor pin ahead of time. Doesn't matter if the ESC isn't active yet, and will start motor with motorInit()
+  // The ESC was attached and stopped before sensor initialization.
 
 
 
@@ -450,29 +631,34 @@ void setup()
   delay(2000);
 }
 
-void(* resetFunc) (void) = 0; //declare reset function @ address 0, this will be called by running resetFunc();
-
 void loop()
 {
   //delay(1000); //enable to make it think slower for sane debugging at loop speed
   //Serial.println(millis()); //this will allow us to calculate the loop speed, but makes the thing horrible to use and lags everything out
   //end debug
-  if (anemfail_notfound == 0) {
-    if (cgAnem.data_update()) // the prints don't have to happen but the function needs to run or the anemometer doesn't pass data
-    {
-      //Serial.println("Air flow rate: " + String(cgAnem.airflowRate) + " m/s");
-      //Serial.println("Current temperature: " + String(cgAnem.temperature) + " C");
-      //Serial.println("Volumetric Flow Rate:" + String(cgAnem.airConsumption) + " m^3/hour");
-      if (cgAnem.unsteadyProcess) {
-        //Serial.println("the sensor is in unstable process and not stabilised");
-      }
-      else {
-        //Serial.println("the sensor is stabilised");
-        //do nothing
-      }
+  if (stopLatched) { acknowledgeStop(); return; }
+  // Service a known deadline before starting another sensor transaction.
+  if (finishExpiredTrial()) return;
+  updateAirflow();
+  if (finishExpiredTrial()) return;
+  if ((motorArming || motorInitComplete || betweenTrials) &&
+      !airflowSample.fresh(uint32_t(millis()))) {
+    stopRun("Airflow fault"); return;
+  }
+  if (motorArming || betweenTrials) {
+    if (digitalRead(ENC_SW) == HIGH) phaseButtonReleased = true;
+    if (phaseButtonReleased && digitalRead(ENC_SW) == LOW) { stopRun("User abort"); return; }
+    const uint32_t waitMs = motorArming ? windos::kArmingMs : windos::kBetweenTrialsMs;
+    if (windos::elapsed(uint32_t(millis()), phaseStartedAt) >= waitMs) {
+      motorArming = betweenTrials = false;
+      firstTrialComplete = true;
+      beginTrial();
     }
-    else
-      checkCgAnem();
+    return;
+  }
+  if (motorInitComplete) {
+    serviceTrial();
+    if (stopLatched || betweenTrials) return;
   }
   //encoder block start
   int8_t tmpdata;
@@ -481,8 +667,7 @@ void loop()
   if ( tmpdata ) {
     //Serial.print("Counter value: ");
     //Serial.println(counter, DEC);
-    counter += tmpdata;
-    read_encoder_rot(); //check rotation only if a new counter value is available
+    read_encoder_rot(tmpdata);
   }
   //end encoder block
 
@@ -498,7 +683,7 @@ void loop()
       heldResetFirstRun = 1; //reset the control flag to allow timer to restart
     }
     if ((digitalRead(ENC_SW) == LOW) && (heldResetFirstRun == 0) && (previousTimeReset <= (millis() - 5000))) { //final check, trigger reset if still held, not first run, and timer has elapsed
-      resetFunc();
+      stopRun("Session reset");
     }
     */
 
@@ -512,6 +697,7 @@ void loop()
     //main interactive and submenu control logic, important to lock this out if the submenus are active otherwise can't move the cursor
     if (main_interactive == 1 && (serial_interactive == 0) && (calibrate_interactive == 0) && sensorstats_interactive == 0) {
       mainMenuUserInput(); //menu logic (main)
+      if (stopLatched) return;
     }
     if ((serial_interactive == 1) && (baud_interactive == 0)) {
       serialMenuUserInput(); //serial menu logic
@@ -547,6 +733,7 @@ void loop()
     }
     if (calibrate_interactive == 1) {
       calibrateMenuUserInput();
+      if (stopLatched) return;
     }
     if (main_interactive == 1) {
       previousTime = millis(); //locks the update loop out to stop menu flashing in submenus
@@ -563,6 +750,7 @@ void loop()
     if ((trialDataEntryComplete == 1) && (runDataEntryComplete == 1) && (motorInitComplete == 1)) { //after data entry and data entry kicking off motor init, then run:
       //will always run as long as motorInit is done, data entry is done, and tunnel is active.
       motorGovernor();
+      if (stopLatched) return;
 
       //if button is pressed while on the run menu, flip interactive variable to true
       if ((run_interactive == 0) && (digitalRead(ENC_SW) == LOW)) { //the run menu display update conditions
@@ -574,6 +762,7 @@ void loop()
       //run interactive and submenu control logic, important to lock this out if the submenus are active otherwise can't move the cursor
       if (run_interactive == 1 && (liveadjustv_interactive == 0) && (sensorstats_interactive == 0)) {
         runMenuUserInput(); //menu logic (run)
+        if (stopLatched) return;
       }
       if (sensorstats_interactive == 1 && barostats_interactive == 0 && anemstats_interactive == 0 && loadstats_interactive == 0) { //multiple lockouts for the submenus
         sensorStatsMenuUserInput();
@@ -625,151 +814,8 @@ void loop()
     if ((trialDataEntryComplete == 0) && (runDataEntryComplete == 1)) {//shortcut to get back to the data entry section
       trialDataEntry();
     }
-    if ((trialDataEntryComplete == 1) && (runDataEntryComplete == 1) && (run_interactive == 0)) { //only tick the clock down or run sensor dumper if user is not in submenus
-
-      if (millis() - previousTime3 >= sensorDumperDelay) {
-        previousTime3 = millis(); // first thing to do is updating the snapshot of time
-        // time for timed action
-        sensorDumperMillis = millis() - sensorResumeMillis; //only update after correcting for time discrepancy from being in submenu
-        sensorDumper(); //this writes each time div (of sensorDumperDelay) of sensor values to the serial port
-      }
-      //sensor dumper state machine
-
-
-
-
-      if ((runTime > 0) && ((millis() - runTimeTickerPrevious >= runTimeTicker))) { //counts millis to determine whole number seconds
-        runTime = (runTime - 1); //subtract 1 second from runtime, tick down the clock
-        runTimeTickerPrevious = millis();
-      }
-      if (runTime <= 0) { // tunnel has finished running
-        motor.writeMicroseconds(0); //stop
-        active = 0; //set tunnel active to 0 to stop the loop from restarting the motor in motorGovernor
-        motorTarget = 1200; //so the ramp and governor knows where to start as opposed to going immediately to whatever speed the target is
-        motorCurrent = 1200; //correspondingly, don't make motorgovernor try to ramp to a different speed until program instructs in the usual place
-        numTrialsObserved++; //increment to make trial counter count up
-        numTrials--;
-
-        /**
-                //begin diagnostic prints. must determine machine state to reset for new trial
-                //menu flow control
-                Serial.println(); //blank line to avoid the sensor dumper
-                Serial.print("startupComplete=");
-                Serial.println(startupComplete); //if 0, check for missing sensors and show error flags if they're not there
-                Serial.print("main_interactive=");
-                Serial.println(main_interactive);
-                Serial.print("run_interactive=");
-                Serial.println(run_interactive);
-                Serial.print("serial_interactive=");
-                Serial.println(serial_interactive);
-                Serial.print("sensorstats_interactive=");
-                Serial.println(sensorstats_interactive);
-                Serial.print("calibrate_interactive=");
-                Serial.println(calibrate_interactive);
-                Serial.print("baud_interactive=");
-                Serial.println(baud_interactive);
-                Serial.print("barostats_interactive=");
-                Serial.println(barostats_interactive);
-                Serial.print("anemstats_interactive=");
-                Serial.println(anemstats_interactive);
-                Serial.print("loadstats_interactive=");
-                Serial.println(loadstats_interactive);
-                Serial.print("liveadjustv_interactive=");
-                Serial.println(liveadjustv_interactive);
-                Serial.print("aboutMenu=");
-                Serial.println(aboutMenu);
-                Serial.print("active=");
-                Serial.println(active);
-
-                //velocity and runtime
-                Serial.print("velocityTarget=");
-                Serial.println(velocityTarget);
-                Serial.print("currentVelocity=");
-                Serial.println(currentVelocity);
-                Serial.print("runTime=");
-                Serial.println(runTime);
-
-                //
-                Serial.print("runTimeTickerPrevious=");
-                Serial.println(runTimeTickerPrevious);
-                Serial.print("runStartMillis=");
-                Serial.println(runStartMillis);
-                Serial.print("sensorDumperMillis=");
-                Serial.println(sensorDumperMillis);
-                Serial.print("sensorResumeMillis=");
-                Serial.println(sensorResumeMillis);
-
-        */
-        //Serial.print("baroyes");
-        //Serial.println(baroyes);
-        //Serial.print("loadcellyes");
-        //Serial.println(loadcellyes);
-
-        //end diagnostic prints
-        if (numTrials > 0) {
-          lcd.clear();
-          lcd.setCursor(0, 0);
-          lcd.print(" Trial(s) complete. ");
-          lcd.setCursor(0, 1);
-          lcd.print("WindOS will run a   "); //data goes at pos 6
-          lcd.setCursor(0, 2);
-          lcd.print("new trial in:       "); //pos 6
-          lcd.setCursor(0, 3);
-          lcd.print("10 seconds.          ");
-          lcd.setCursor(10, 3); //begin overwriting the " " on last line from left to right with "." every second (makes it look slick without much effort, hey?)
-          delay (1000);
-          lcd.print(".");
-          delay (1000);
-          lcd.print(".");
-          delay (1000);
-          lcd.print(".");
-          delay (1000);
-          lcd.print(".");
-          delay(1000);
-          lcd.print(".");
-          delay (1000);
-          lcd.print(".");
-          delay (1000);
-          lcd.print(".");
-          delay (1000);
-          lcd.print(".");
-          delay(1000);
-          lcd.print(".");
-        }
-
-        //delay(100000); // debug delay to stop it from resetting, normally comment out
-        if (numTrials > 0) { //negative is undefined for numTrials
-          //rerun, we're going again!
-          active = 1;
-          runTime = originalRunTime; //reset runtime to rewind the clock
-          dataDumperFirstRun = 1; //reset this to print the first measurement note window again
-          sensorDumperInit();
-        }
-        if (numTrials == 0) {
-          lcd.setCursor(0, 0);
-          lcd.print(" Trial(s) completed.");
-          lcd.setCursor(0, 1);
-          lcd.print("WindOS will reset in"); //data goes at pos 6
-          lcd.setCursor(0, 2);
-          lcd.print("5 seconds           "); //pos 6
-          lcd.setCursor(0, 3);
-          lcd.print("                    ");
-          delay(5000);
-          resetFunc();
-        }
-      }
-    }
   } //end active section, nothing in here will run if not activated yet
 } //end of void loop
-
-void checkCgAnem()
-{
-
-  //if (cgAnem.overVcc)
-  //Serial.println("the input voltage is too high and Anemometer module is in self-protect mode");
-  //else //uncomment if you use the if else
-  //Serial.println("Anemometer wiring error");
-}
 
 /* returns change in encoder state (-1,0,1) */
 int8_t read_encoder()
@@ -783,28 +829,14 @@ int8_t read_encoder()
   return ( enc_states[( old_AB & 0x0f )]);
 }
 
-void read_encoder_rot() {
-  if (counter != oldcounter) {
-    if (counter < oldcounter) {
-      encoder_CCW = 1;
-      //Serial.print("encoder_CCW=");
-      //Serial.print(encoder_CCW);
-      //Serial.println();
-      //Serial.print("CCW");
-      //Serial.println();
-    }
-    if (counter > oldcounter) {
-      encoder_CW = 1;
-      //Serial.print("encoder_CW=");
-      //Serial.print(encoder_CW);
-      //Serial.println();
-      //Serial.print("CW");
-      //Serial.println();
-    }
-    oldcounter = counter;
-  }
+void read_encoder_rot(int8_t direction) {
+  encoder_CCW = direction < 0;
+  encoder_CW = direction > 0;
 }
 void warmup () { //switch into active mode as commanded my main_interactive
+  if (!airflowSample.fresh(uint32_t(millis())) || !anemUpdateReady) {
+    stopRun("Airflow not ready"); return;
+  }
   active = 1;
   runStartInit ();
   //motorInit(); //actually start the motor, shouldn't do it here except for debugging
@@ -1113,7 +1145,7 @@ void mainMenuUserInput() {
         displayUpdate(); //make it snappy
       }
       if (main_hover_7 == 1) {
-        resetFunc(); //reset us now, user commanded reset
+        stopRun("Session reset"); //reset us now, user commanded reset
       }
     } //end digitalRead==LOW
   } // end "no longer the first run"
@@ -1329,31 +1361,12 @@ void runMenuUserInput() {
         //Serial.print("return to run menu from run_interactive");
         //Serial.println();
         run_interactive = 0; //return to the run, labeled "Info Screen"
-        //perform time correction
-        sensorResumeMillis = millis() - sensorDumperMillis; //time discrepancy value should be current value of millis minus old value of millis
+        // Navigation does not change the acquisition clock.
         displayUpdate(); //does one update, lets the user see their menu faster. makes it _feel_ faster
       }
       if (run_hover_2 == 1) {
-        //Abort routine call here
-        Serial.println("User commanded hard reset!!!! Program resetting...");
-        //motor.detach(); //Emergency stop
-        motor.writeMicroseconds(0); //stop
-        /**
-          lcd.clear();
-          lcd.setCursor(0, 0);
-          lcd.print("E-STOP!!! Halted!   ");
-          lcd.setCursor(0, 1);
-          lcd.print("Remove power from   "); //data goes at pos 6
-          lcd.setCursor(0, 2);liveadjustv
-          lcd.print("the motor before    "); //pos 6
-          lcd.setCursor(0, 3);
-          lcd.print("cycling power.      ");
-        */
-        delay (100);
-        //while (1) {
-        //do nothing forever
-        //}
-        resetFunc(); //will hard reset but will also make motor throttle up to 100% after a few seconds, so we don't use it for E-stops
+        stopRun("User abort");
+        return;
       }
       if (run_hover_3 == 1) {
         //Sensor Stats page call here
@@ -1382,19 +1395,19 @@ void runMenuUserInput() {
   } // end "no longer the first run"
 } //end runMenuUserInput
 
-void motorInit() { //should run once, triggered after trialDataEntry. will start motor at idle speed
-  motorTarget = 1200; //so the ramp and governor knows where to start
-  motorCurrent = 1200;
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Motor Init");
-  lcd.setCursor(0, 1);
-  lcd.print("Please wait...");
-  motorInitComplete = 1;
-  motor.writeMicroseconds(700); // send "stop" signal to ESC. Also necessary to arm the ESC.
-  delay(7000); // delay to allow the ESC to recognize the stopped signal.
-  motor.writeMicroseconds(1200); //bring motor to idle speed
-  firstTrialComplete = 1;
+void motorInit() {
+  if (originalRunTime <= 0) { stopRun("Set a run duration"); return; }
+  if (!airflowSample.fresh(uint32_t(millis())) || !anemUpdateReady) {
+    stopRun("Airflow not ready"); return;
+  }
+  motorTarget = motorCurrent = windos::kIdlePulseUs;
+  motorInitComplete = false;
+  motorArming = true;
+  phaseStartedAt = uint32_t(millis());
+  phaseButtonReleased = digitalRead(ENC_SW) == HIGH;
+  motor.writeMicroseconds(windos::kStopPulseUs);
+  lcd.clear(); lcd.print("Arming motor (7s)");
+  lcd.setCursor(0, 3); lcd.print("Click to abort");
 }
 
 void runStartInit () { //prints out the static elements of the run data entry screen
@@ -1644,9 +1657,6 @@ void runDataEntry() { //needs to be shortcut into the loop
     while (digitalRead(ENC_SW) == LOW && (sensorSelectBaro == 0)) {//this is not as nice ui wise but it prevents stalling the whole program
       sensorSelectBaro = 1;
       //Serial.println("barodone");
-      if (((barofail_1 == 1) || (barofail_2 == 1) || (barofail_3 == 1) || (barofail_4 == 1) || (barofail_5 == 1) || (barofail_6 == 1) || (barofail_7 == 1))) {
-        baroyes = 0; //override it if the user is being obtuse and asking for baro data when one is missing, prevents reads later
-      }
       delay(clickDelay);
     }
     //end baro sensor select
@@ -1655,6 +1665,9 @@ void runDataEntry() { //needs to be shortcut into the loop
       lcd.clear();
       lcd.setCursor(0, 0);
       lcd.print("Use Load Cell Data? ");
+      if (!calibrationValid[0] || !calibrationValid[1]) {
+        lcd.setCursor(0, 3); lcd.print("Calibration required");
+      }
       lcd.setCursor(0, 1);
       lcd.print(">Yes");
       lcd.setCursor(1, 2);
@@ -1784,165 +1797,74 @@ void trialDataEntry() { //needs to be shortcut into the loop
 
 //begin motor governor functions
 void motorGovernor() {
-  currentVelocity = floor(int(cgAnem.airflowRate)); //get current velocity and throw out the decimals. Real speed will be logged but the governor will tend to keep things at or above target speed by 1 m/s, so -0.00,+0.99m/s
-
-  if (millis() - motorRampSlopePrevious >= motorRampSlope) { //state machine to control the motor, will only update motor if enough time has elapsed since the last adjustment. This governs the governor
-    motorRampSlopePrevious = millis(); // first thing to do is updating the snapshot of time
-    // time for timed action
-
-    if ((currentVelocity < velocityTarget) && (motorTarget < motorpwmlimit)) {
-      motorTarget = motorTarget + 10; // where 10 is the constant, or P term. these are in pulses, not motor percents, because theyre smaller.
-      //motorRamp(); //execute the change
-      //motorGo(motorTarget); //testing to see if this is faster than ramping, IE no lag
-    }
-    if (currentVelocity > velocityTarget) {
-      motorTarget = motorTarget - 10;
-      //motorRamp(); //execute the change
-
-    }
+  if (!motorInitComplete || stopLatched || finishExpiredTrial()) return;
+  if (!airflowSample.fresh(uint32_t(millis()))) { stopRun("Airflow fault"); return; }
+  // Failed/unsteady updates cannot increase throttle within the freshness grace.
+  if (!anemUpdateReady) return;
+  currentVelocity = int(airflowSample.velocity);
+  if (uint32_t(uint32_t(millis()) - uint32_t(motorRampSlopePrevious)) >= uint32_t(motorRampSlope)) {
+    motorRampSlopePrevious = millis();
+    if (currentVelocity < velocityTarget) motorTarget += 10;
+    if (currentVelocity > velocityTarget) motorTarget -= 10;
+    motorTarget = windos::boundedPulse(motorTarget, motorpwmlimit);
     motorGo(motorTarget);
   }
 }
 
-//two governors??
-
-/**
-  void motorRamp() { //sends motor from current speed to target speed at ramp constant speed, adjust ramp constant to increase or decrease motor slope, will need state machines to fully optimize. Laggy?
-  if (motorTarget > motorCurrent) {
-    //Serial.println("Ramping UP");
-    //for (int i = motorCurrent; i < motorpwmlimit; i++) {//ramp up
-    if (millis() - motorRampSlopePrevious >= motorRampSlope) { //state machine to control the motor, will only update motor if enough time has elapsed since the last adjustment. This governs the governor
-      motorRampSlopePrevious = millis(); // first thing to do is updating the snapshot of time
-      // time for timed action
-      if (motorTarget < motorpwmlimit) { //must add this extra check or ESC gets unhappy with out of range values and shuts down
-      motorGo(motorTarget);
-      }
-      else {
-        motorTarget = motorpwmlimit;
-      }
-
-      //Serial.print(i);
-      //motorCurrent = i;
-    }
-    //if (motorCurrent == motorTarget) {
-    // break;
-    //}
-    //}
+void motorGo(int requested) {
+  // Final gate also covers direct commands and time spent in menus/acquisition.
+  if (finishExpiredTrial()) return;
+  if (stopLatched || !motorInitComplete || !airflowSample.fresh(uint32_t(millis()))) {
+    motor.writeMicroseconds(windos::kStopPulseUs); return;
   }
-  if (motorTarget < motorCurrent) {
-    //Serial.println("Ramping DOWN");
-    //for (int i = motorCurrent; i > 1150; i--) { //ramp down
-    if (millis() - motorRampSlopePrevious >= motorRampSlope) { //state machine to control the motor, will only update motor if enough time has elapsed since the last adjustment. This governs the governor
-      motorRampSlopePrevious = millis(); // first thing to do is updating the snapshot of time
-      // time for timed action
-      motorGo(motorTarget);
-      //Serial.print(i);
-      //motorCurrent = i;
-    }
-    //if (motorCurrent == motorTarget) {
-    //break;
-    //}
-
-
-
-
-    // time for timed action
-    //delay(motorCurveGain);
-    //motorGo(i);
-    //Serial.print(i);
-    //motorCurrent = i;
-    //}
-  }
-  } //end motorRamp
-*/
-
-int motorGo(int motorCommand) { //spin motor at motorCommand pulse rate
-  motor.writeMicroseconds(motorCommand);
+  motorTarget = windos::boundedPulse(requested, motorpwmlimit);
+  motor.writeMicroseconds(motorTarget);
 }
 
-void sensorDumperInit() { //this is the first line, after this will be called by the loop
-  runStartMillis = millis(); //stores value of millis at time of sensorDumperInit execution
-  Serial.println("WindOS Sensor Dump,Elapsed Time (s),Barometer 1 (mbar),Barometer 2 (mbar),Barometer 3 (mbar),Barometer 4 (mbar),Barometer 5 (mbar),Barometer 6 (mbar),Barometer 7 (mbar),Velocity (m/s),Velocity Target (m/s),Temperature (Celcius),Load Cell 1 (g),Load Cell 2 (g),Commanded Motor Power (%)");
+void sensorDumperInit() {
+  Serial.println("WindOS Sensor Dump,Elapsed Time (s),Barometer 1 (mbar),Barometer 2 (mbar),Barometer 3 (mbar),Barometer 4 (mbar),Barometer 5 (mbar),Barometer 6 (mbar),Barometer 7 (mbar),Velocity (m/s),Velocity Target (m/s),Temperature (Celcius),Load Cell 1 (g),Load Cell 2 (g),Commanded Motor Power (%),Trial ID,Airflow Status,Pressure Status,Load Cell 1 Status,Load Cell 2 Status");
 }
 
 void sensorDumper() {
-  if (baroyes == 1) { //if user has asked for baro data...
-    //get new sensor values
-    baroSelect = 0; //baro 0
-    baroRead();
-    baroSelect = 1; //baro 1
-    baroRead();
-    baroSelect = 2; //baro 2
-    baroRead();
-    baroSelect = 3; //baro 3
-    baroRead();
-    baroSelect = 4; //baro 4
-    baroRead();
-    baroSelect = 5; //baro 5
-    baroRead();
-    baroSelect = 6; //baro 6
-    baroRead();
+  if (baroyes) for (baroSelect = 0; baroSelect < 7; ++baroSelect) baroRead();
+  const float pressures[7] = {baro0, baro1, baro2, baro3, baro4, baro5, baro6};
+  float loads[2] = {NAN, NAN};
+  if (loadcellyes) {
+    if (calibrationValid[0]) loads[0] = readLoadCell(LoadCell_1);
+    if (calibrationValid[1]) loads[1] = readLoadCell(LoadCell_2);
   }
-
-  //now baro0 - baro7 should have values
-
-  if (baroyes == 0) { //if user has asked for no baro data...
-    baro0 = 0;
-    baro1 = 0;
-    baro2 = 0;
-    baro3 = 0;
-    baro4 = 0;
-    baro5 = 0;
-    baro6 = 0;
+  if (dataDumperFirstRun) {
+    Serial.print("Trial Number: "); Serial.print(numTrialsObserved);
+    dataDumperFirstRun = false;
   }
-
-  //String(cgAnem.airflowRate) //we can use these directly in the prints
-  //String(cgAnem.temperature)
-
-  //echo values to serial port
-  if (dataDumperFirstRun == 1) {
-    Serial.print("Trial Number: ");
-    Serial.print(numTrialsObserved); //this is a variable which will only get ++numTrialsObserved incremented by 1, this is a seperate counter to numTrials which actually controlls the behavior at the end of the program
-    dataDumperFirstRun = 0;
+  Serial.print(","); Serial.print(float(sensorDumperMillis) / 1000.0f, 3);
+  for (uint8_t i = 0; i < 7; ++i) {
+    Serial.print(",");
+    if (baroyes && pressureValid[i]) Serial.print(pressures[i], 2);
   }
-  Serial.print(""); //message window, can switch this with an if for several flags but for now no flags are used so leave the space
-  Serial.print(","); //next value
-  Serial.print((float(sensorDumperMillis - runStartMillis)) / 1000); //prints elapsed test time in seconds for plotting test results over time
-  Serial.print(","); //next value
-  Serial.print(baro0);
-  Serial.print(","); //next value
-  Serial.print(baro1);
-  Serial.print(","); //next value
-  Serial.print(baro2);
-  Serial.print(","); //next value
-  Serial.print(baro3);
-  Serial.print(","); //next value
-  Serial.print(baro4);
-  Serial.print(","); //next value
-  Serial.print(baro5);
-  Serial.print(","); //next value
-  Serial.print(baro6);
-  Serial.print(","); //next value
-  Serial.print(String(cgAnem.airflowRate));
-  Serial.print(","); //next value
-  Serial.print(float(float(velocityTarget) + 0.5)); //add 0.5 to make range center correctly
   Serial.print(",");
-  Serial.print(String(cgAnem.temperature));
+  const bool fresh = airflowSample.fresh(uint32_t(millis()));
+  if (fresh) Serial.print(airflowSample.velocity, 2);
+  Serial.print(","); Serial.print(float(velocityTarget) + 0.5f, 2);
   Serial.print(",");
-  if (loadcellyes == 1) { //if user has asked for load cell data...
-    Serial.print(LoadCell_1.get_units(), 2); //extra precision by asking for , 2 in the serial print
+  if (fresh && anemUpdateReady && isfinite(cgAnem.temperature) && cgAnem.temperature != -255)
+    Serial.print(cgAnem.temperature, 2);
+  for (uint8_t i = 0; i < 2; ++i) {
     Serial.print(",");
-    Serial.print(LoadCell_2.get_units(), 2); //ditto
-    Serial.print(",");
+    if (isfinite(loads[i])) Serial.print(loads[i], 2);
   }
-  if (loadcellyes == 0) {//if user has NOT asked for load cell data, we must still satisfy the data header...
-    Serial.print("0");
+  Serial.print(","); Serial.print(float(motorTarget - windos::kIdlePulseUs) / 7.0f, 2);
+  Serial.print(","); Serial.print(numTrialsObserved);
+  Serial.print(","); Serial.print(!fresh ? "invalid" : (anemUpdateReady ? "ok" : "held"));
+  Serial.print(",");
+  if (!baroyes) Serial.print("disabled");
+  else for (uint8_t i = 0; i < 7; ++i) Serial.print(pressureValid[i] ? '1' : '0');
+  for (uint8_t i = 0; i < 2; ++i) {
     Serial.print(",");
-    Serial.print("0");
-    Serial.print(",");
+    Serial.print(!loadcellyes ? "disabled" : (!calibrationValid[i] ? "uncalibrated" :
+                 (isfinite(loads[i]) ? "ok" : "unavailable")));
   }
-  Serial.print(float(((float(motorTarget) - 1200) / 700) * 100)); //prints motor percentage (converts from PWM)
-  Serial.println();//line feed because we're done printing values
+  Serial.println();
 }
 
 void anemStatsDisplay() {
@@ -1976,7 +1898,7 @@ void anemStatsDisplay() {
     lcd.setCursor(0, 1);
     lcd.print("Not Found!");
   }
-  while (digitalRead(ENC_SW) == LOW) { //exit trap
+  if (digitalRead(ENC_SW) == LOW) { // Never trap the active control loop.
     //cant use a delay here because it will upset the timing of data collection in the run loop
     anemstats_interactive = 0;
     displayUpdate(); //show the menu
@@ -1998,8 +1920,8 @@ void loadStatsDisplay() {
   }
 
   //nonzeroed load cell values
-  loadCell1Reading = LoadCell_1.get_units(); //unlike loadCellGo, we use this to change the direction of the vector to have positive force be up instead of down
-  loadCell2Reading = LoadCell_2.get_units(); //unlike loadCellGo, we use this to change the direction of the vector to have positive force be up instead of down
+  loadCell1Reading = displayLoadCell(LoadCell_1); //unlike loadCellGo, we use this to change the direction of the vector to have positive force be up instead of down
+  loadCell2Reading = displayLoadCell(LoadCell_2); //unlike loadCellGo, we use this to change the direction of the vector to have positive force be up instead of down
 
   //custom clear, only targets dynamic rows
   lcd.setCursor(12, 1);
@@ -2009,13 +1931,13 @@ void loadStatsDisplay() {
 
   //print load cell 1 to screen
   lcd.setCursor(12, 1);
-  lcd.print(loadCell1Reading);
+  printLoadCell(0, loadCell1Reading);
   lcd.print("g"); //equivalent to mbar but also 1 letter shorter, more space on the menu. I would have otherwise set this to say mbar
   lcd.setCursor(12, 2);
-  lcd.print(loadCell2Reading);
+  printLoadCell(1, loadCell2Reading);
   lcd.print("g"); //equivalent to mbar but also 1 letter shorter, more space on the menu. I would have otherwise set this to say mbar
 
-  while (digitalRead(ENC_SW) == LOW) { //exit trap
+  if (digitalRead(ENC_SW) == LOW) { // Never trap the active control loop.
     //cant use a delay here because it will upset the timing of data collection in the run loop
     loadstats_interactive = 0;
     displayUpdate(); //show the menu
@@ -2046,7 +1968,7 @@ void loadcellCalibrate1() {
     //lcd.setCursor(0, 3);
     //lcd.print("");
     delay(5000); //delay longer than standard because this is the "no touch" section
-    LoadCell_1.tare(); //Reset the LoadCell_1 to 0
+    if (!tareLoadCell(LoadCell_1)) { stopRun("Load cell unavailable"); return; } //Reset the LoadCell_1 to 0
     LoadCell_1.set_scale(calibration_factor_1); //Adjust to this calibration factor
     lcd.setCursor(0, 0);
     lcd.print("Current Cal. Factor:");
@@ -2116,7 +2038,8 @@ void loadcellCalibrate1() {
       //Serial.print(loadcellcalibratedmass);
       //Serial.println();
 
-      calibration_factor_1 = -99999; //unlikely to match the mass, use as a starting point to drive the calibration
+      calibrationCaptureActive = false;
+      // Keep the last valid scale until a replacement is verified.
       loadCellGo1Active = 1; //shortcut flag
       //Serial.print("loadCellDataEntryExit1");
       //Serial.println();
@@ -2162,7 +2085,7 @@ void loadcellCalibrate2() {
     //lcd.setCursor(0, 3);
     //lcd.print("");
     delay(5000); //delay longer than standard because this is the "no touch" section
-    LoadCell_2.tare(); //Reset the LoadCell_1 to 0
+    if (!tareLoadCell(LoadCell_2)) { stopRun("Load cell unavailable"); return; } //Reset the LoadCell_1 to 0
 
 
 
@@ -2234,7 +2157,8 @@ void loadcellCalibrate2() {
       //Serial.print("loadCellCalibratedMass=");
       //Serial.print(loadcellcalibratedmass);
       //Serial.println();
-      calibration_factor_2 = -99999;
+      calibrationCaptureActive = false;
+      // Keep the last valid scale until a replacement is verified.
       loadCellGo2Active = 1; //shortcut flag
       //Serial.print("loadCellDataEntryExit2");
       //Serial.println();
@@ -2253,374 +2177,36 @@ void loadcellCalibrate2() {
   }
 }
 
-void loadCellGo1() { //calibrate first load cell. This is called after the user input and also is shortcut to based on flag, same way load cell data entry is
-  //loadcellcalibratedmass is the user input mass
-  //calibration factor will be reset to a definitely-unsolved factor for driving to user mass
-  LoadCell_1.set_scale(calibration_factor_1);
-  loadCellGo1Reading = (-1 * LoadCell_1.get_units());
-
-  lcd.setCursor(14, 0);
-  lcd.print(loadCellGo1Reading, DEC); //start prints at 14
-  lcd.setCursor(11, 1);
-  lcd.print(calibration_factor_1); //11
-
-
-  if (loadcellprecision1 == 3) { // you've satisfied 1000, 100, and 10 adjustment speeds
-    //exit, lower loadCellGo flag
-    loadCellGo1Active = 0; //deactivate the running routine
-    calibrate_interactive = 0; //exit calibrate menu
-    //Serial.print("loadCellGo1 Exited!");
-    //Serial.println();
-    //Serial.print("mass reading EXIT:");
-    //Serial.print(loadCellGo1Reading, DEC);
-    //Serial.println();
-    //Serial.print("calibration_factor_1 EXIT=");
-    //Serial.print(calibration_factor_1, DEC);
-    //Serial.println();
-    EEPROM.put(0, calibration_factor_1);
-    //Serial.print("calibration_factor_1 stored to EEPROM!");
-    //Serial.println();
-    delay(3000); //delay to allow user to see that the calibration is done
-    displayUpdate(); //to print the applicable menu
-
+void calibrateLoadCell(uint8_t channel) {
+  HX711 &sensor = channel == 0 ? LoadCell_1 : LoadCell_2;
+  float &factor = channel == 0 ? calibration_factor_1 : calibration_factor_2;
+  if (loadcellcalibratedmass <= 0) { stopRun("Mass must be > 0"); return; }
+  if (!calibrationCaptureActive) {
+    calibrationCaptureActive = true;
+    calibrationStartedAt = uint32_t(millis());
+    calibrationSamples = 0;
+    calibrationSum = 0;
+    sensor.set_scale(factor);
   }
-  loadCellGo1Reading = (-1 * LoadCell_1.get_units()); //must update before we check or it could be outdated for single-loop corrections
-  if ((loadcellcalibratedmass > loadCellGo1Reading) && (loadcellprecision1 == 0) && (loadcellprecision1 != 3)) { //super coarse adjustment
-    calibration_factor_1 += 1000; //large negative number will get closer to 0
-
-    LoadCell_1.set_scale(calibration_factor_1); //apply the new calibration factor to the load cell
-    loadCellGo1Reading = (-1 * LoadCell_1.get_units()); //also must update afterwards
-
-    if (loadCellGo1Reading < 0) { //divide by zero? produces large funky negative valuers, like underflow.
-      if (loadcellprecision1 == 0) {
-        calibration_factor_1 -= 1001;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      if (loadcellprecision1 == 1) {
-        calibration_factor_1 -= 101;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      if (loadcellprecision1 == 2) {
-        calibration_factor_1 -= 11;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      LoadCell_1.set_scale(calibration_factor_1); //apply the new calibration factor to the load cell
-      loadCellGo1Reading = (-1 * LoadCell_1.get_units()); //also must update afterwards
-    }
-    //Serial.print("mass reading:");
-    //Serial.print(loadCellGo1Reading, DEC);
-    //Serial.println();
-    //Serial.print("calibration_factor_1=");
-    //Serial.print(calibration_factor_1, DEC);
-    //Serial.println();
-
-
+  if (windos::elapsed(uint32_t(millis()), calibrationStartedAt) >= 10000) {
+    stopRun("Calibration timeout"); return;
   }
-
-  if ((loadcellcalibratedmass > loadCellGo1Reading) && (loadcellprecision1 == 1) && (loadcellprecision1 != 3)) { //coarse adjustment
-    calibration_factor_1 += 100; //large negative number will get closer to 0
-
-    LoadCell_1.set_scale(calibration_factor_1); //apply the new calibration factor to the load cell
-    loadCellGo1Reading = (-1 * LoadCell_1.get_units());
-
-    if (loadCellGo1Reading < 0) { //divide by zero? produces large funky negatiive valuers, like underflow.
-      if (loadcellprecision1 == 0) {
-        calibration_factor_1 -= 1001;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      if (loadcellprecision1 == 1) {
-        calibration_factor_1 -= 101;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      if (loadcellprecision1 == 2) {
-        calibration_factor_1 -= 11;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      LoadCell_1.set_scale(calibration_factor_1); //apply the new calibration factor to the load cell
-      loadCellGo1Reading = (-1 * LoadCell_1.get_units()); //also must update afterwards
-    }
-
-    //Serial.print("mass reading:");
-    //Serial.print(loadCellGo1Reading, DEC);
-    //Serial.println();
-    //Serial.print("calibration_factor_1=");
-    //Serial.print(calibration_factor_1, DEC);
-    //Serial.println();
-
-
-  }
-  if ((loadcellcalibratedmass > loadCellGo1Reading) && (loadcellprecision1 == 2) && (loadcellprecision1 != 3)) { //fine adjustment
-    calibration_factor_1 += 10; //large negative number will get closer to 0
-
-    LoadCell_1.set_scale(calibration_factor_1); //apply the new calibration factor to the load cell
-    loadCellGo1Reading = (-1 * LoadCell_1.get_units());
-
-    if (loadCellGo1Reading < 0) { //divide by zero? produces large funky negative valuers, like underflow.
-      if (loadcellprecision1 == 0) {
-        calibration_factor_1 -= 1001;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      if (loadcellprecision1 == 1) {
-        calibration_factor_1 -= 101;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      if (loadcellprecision1 == 2) {
-        calibration_factor_1 -= 11;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      LoadCell_1.set_scale(calibration_factor_1); //apply the new calibration factor to the load cell
-      loadCellGo1Reading = (-1 * LoadCell_1.get_units()); //also must update afterwards
-    }
-
-    //Serial.print("mass reading:");
-    //Serial.print(loadCellGo1Reading, DEC);
-    //Serial.println();
-    //Serial.print("calibration_factor_1=");
-    //Serial.print(calibration_factor_1, DEC);
-    //Serial.println();
-  }
-
-  if (loadcellcalibratedmass <= loadCellGo1Reading) { //we check here but we also MUST check in the loop because otherwise the calibratedmass vs reading wont get checked
-    //Serial.print("loadcellcalibratedmass <= loadCellGo1Reading!!");
-    //Serial.println();
-    if (loadcellprecision1 == 0 && loadcellprecision1 != 1 && loadcellprecision1 != 2 && (loadcellprecision1 != 3)) { //adds back 1000 to get closer without undershooting. makes the code easier
-      calibration_factor_1 -= 1000;//I say "adds back" but calibration factor starts out very negative
-      LoadCell_1.set_scale(calibration_factor_1);
-      loadCellGo1Reading = (-1 * LoadCell_1.get_units()); //just modified the cal factor, make scale correct
-      loadcellprecision1 = 1; //takes us to precision level 1
-      //Serial.print("precision level 1");
-      //Serial.println();
-      //Serial.print("calibration factor:");
-      //Serial.print(calibration_factor_1, DEC);
-      //Serial.println();
-      //Serial.print("mass reading:");
-      //Serial.print(loadCellGo1Reading, DEC);
-      //Serial.println();
-    }
-    if ((loadcellcalibratedmass <= loadCellGo1Reading) && loadcellprecision1 == 1 && loadcellprecision1 != 0 && loadcellprecision1 != 2 && (loadcellprecision1 != 3)) {
-      calibration_factor_1 -= 100;
-      LoadCell_1.set_scale(calibration_factor_1);
-      loadCellGo1Reading = (-1 * LoadCell_1.get_units());
-      loadcellprecision1 = 2; //takes us to precision level 2
-      //Serial.print("precision level 2");
-      //Serial.println();
-      //Serial.print("calibration factor:");
-      //Serial.print(calibration_factor_1, DEC);
-      //Serial.println();
-      //Serial.print("mass reading:");
-      //Serial.print(loadCellGo1Reading, DEC);
-      //Serial.println();
-    }
-    if ((loadcellcalibratedmass <= loadCellGo1Reading) && loadcellprecision1 == 2 && loadcellprecision1 != 0 && loadcellprecision1 != 1 && (loadcellprecision1 != 3)) {
-      calibration_factor_1 -= 10;
-      LoadCell_1.set_scale(calibration_factor_1);
-      loadCellGo1Reading = (-1 * LoadCell_1.get_units());
-      loadcellprecision1 = 3; //takes us to precision level 3 and trips the exit routine
-      //Serial.print("precision level 3");
-      //Serial.println();
-      //Serial.print("calibration factor:");
-      //Serial.print(calibration_factor_1, DEC);
-      //Serial.println();
-      //Serial.print("mass reading:");
-      //Serial.print(loadCellGo1Reading, DEC);
-      //Serial.println();
-    }
-  }
+  const float reading = readLoadCell(sensor);
+  if (!isfinite(reading)) return; // Wait for another conversion without blocking.
+  calibrationSum += -reading; // Preserve the existing hanging-mass convention.
+  if (++calibrationSamples < 16) return;
+  const float calibrated = factor * (calibrationSum / 16.0f) / float(loadcellcalibratedmass);
+  if (!saveCalibration(channel, calibrated)) { stopRun("Calibration invalid"); return; }
+  factor = calibrated;
+  sensor.set_scale(factor);
+  calibrationCaptureActive = false;
+  loadCellGo1Active = loadCellGo2Active = false;
+  calibrate_interactive = false;
+  displayUpdate();
 }
 
-
-
-void loadCellGo2() { //calibrate first load cell. This is called after the user input and also is shortcut to based on flag, same way load cell data entry is
-  //loadcellcalibratedmass is the user input mass
-  //calibration factor will be reset to a definitely-unsolved factor for driving to user mass
-  LoadCell_2.set_scale(calibration_factor_2);
-  loadCellGo2Reading = (-1 * LoadCell_2.get_units());
-
-  lcd.setCursor(14, 0);
-  lcd.print(loadCellGo2Reading, DEC); //start prints at 14
-  lcd.setCursor(11, 1);
-  lcd.print(calibration_factor_2); //11
-
-  if (loadcellprecision2 == 3) { // you've satisfied 1000, 100, and 10 adjustment speeds
-    //exit, lower loadCellGo flag
-    loadCellGo2Active = 0; //deactivate the running routine
-    calibrate_interactive = 0; //exit calibrate menu
-    //Serial.print("loadCellGo2 Exited!");
-    //Serial.println();
-    //Serial.print("mass reading EXIT:");
-    //Serial.print(loadCellGo2Reading, DEC);
-    //Serial.println();
-    //Serial.print("calibration_factor_2 EXIT=");
-    //Serial.print(calibration_factor_2, DEC);
-    //Serial.println();
-    EEPROM.put(8, calibration_factor_2);
-    //Serial.print("calibration_factor_1 stored to EEPROM!");
-    //Serial.println();
-    delay(3000); //delay to allow user to see that the calibration is done
-    displayUpdate(); //to print the applicable menu
-
-  }
-  loadCellGo2Reading = (-1 * LoadCell_2.get_units()); //must update before we check or it could be outdated for single-loop corrections
-  if ((loadcellcalibratedmass > loadCellGo2Reading) && (loadcellprecision2 == 0) && (loadcellprecision2 != 3)) { //super coarse adjustment
-    calibration_factor_2 += 1000; //large negative number will get closer to 0
-
-    LoadCell_2.set_scale(calibration_factor_2); //apply the new calibration factor to the load cell
-    loadCellGo2Reading = (-1 * LoadCell_2.get_units()); //also must update afterwards
-
-    if (loadCellGo2Reading < 0) { //divide by zero? produces large funky negatiive valuers, like underflow.
-      if (loadcellprecision2 == 0) {
-        calibration_factor_2 -= 1001;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      if (loadcellprecision2 == 1) {
-        calibration_factor_2 -= 101;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      if (loadcellprecision2 == 2) {
-        calibration_factor_2 -= 11;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      LoadCell_2.set_scale(calibration_factor_2); //apply the new calibration factor to the load cell
-      loadCellGo2Reading = (-1 * LoadCell_2.get_units()); //also must update afterwards
-    }
-    //Serial.print("mass reading:");
-    //Serial.print(loadCellGo2Reading, DEC);
-    //Serial.println();
-    //Serial.print("calibration_factor_2=");
-    //Serial.print(calibration_factor_2, DEC);
-    //Serial.println();
-    //CRASH or fails to hit another loop
-
-  }
-
-  if ((loadcellcalibratedmass > loadCellGo2Reading) && (loadcellprecision2 == 1) && (loadcellprecision2 != 3)) { //coarse adjustment
-    calibration_factor_2 += 100; //large negative number will get closer to 0
-
-    LoadCell_2.set_scale(calibration_factor_2); //apply the new calibration factor to the load cell
-    loadCellGo2Reading = (-1 * LoadCell_2.get_units());
-
-    if (loadCellGo2Reading < 0) { //divide by zero? produces large funky negatiive valuers, like underflow.
-      if (loadcellprecision2 == 0) {
-        calibration_factor_2 -= 1001;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      if (loadcellprecision2 == 1) {
-        calibration_factor_2 -= 101;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      if (loadcellprecision2 == 2) {
-        calibration_factor_2 -= 11;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      LoadCell_2.set_scale(calibration_factor_2); //apply the new calibration factor to the load cell
-      loadCellGo2Reading = (-1 * LoadCell_2.get_units()); //also must update afterwards
-    }
-
-    //Serial.print("mass reading:");
-    //Serial.print(loadCellGo2Reading, DEC);
-    //Serial.println();
-    //Serial.print("calibration_factor_2=");
-    //Serial.print(calibration_factor_2, DEC);
-    //Serial.println();
-
-
-  }
-  if ((loadcellcalibratedmass > loadCellGo2Reading) && (loadcellprecision2 == 2) && (loadcellprecision2 != 3)) { //fine adjustment
-    calibration_factor_2 += 10; //large negative number will get closer to 0
-
-    LoadCell_2.set_scale(calibration_factor_2); //apply the new calibration factor to the load cell
-    loadCellGo2Reading = (-1 * LoadCell_2.get_units());
-
-    if (loadCellGo2Reading < 0) { //divide by zero? produces large funky negatiive valuers, like underflow.
-      if (loadcellprecision2 == 0) {
-        calibration_factor_2 -= 1001;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      if (loadcellprecision2 == 1) {
-        calibration_factor_2 -= 101;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      if (loadcellprecision2 == 2) {
-        calibration_factor_2 -= 11;
-        //Serial.print("Negative safety tripped!");
-        //Serial.println();
-      }
-      LoadCell_2.set_scale(calibration_factor_2); //apply the new calibration factor to the load cell
-      loadCellGo2Reading = (-1 * LoadCell_2.get_units()); //also must update afterwards
-    }
-
-    //Serial.print("mass reading:");
-    //Serial.print(loadCellGo2Reading, DEC);
-    //Serial.println();
-    //Serial.print("calibration_factor_2=");
-    //Serial.print(calibration_factor_2, DEC);
-    //Serial.println();
-  }
-
-  if (loadcellcalibratedmass <= loadCellGo2Reading) { //we check here but we also MUST check in the loop because otherwise the calibratedmass vs reading wont get checked
-    //Serial.print("loadcellcalibratedmass <= loadCellGo2Reading!!");
-    //Serial.println();
-    if (loadcellprecision2 == 0 && loadcellprecision2 != 1 && loadcellprecision2 != 2 && (loadcellprecision2 != 3)) { //adds back 1000 to get closer without undershooting. makes the code easier
-      calibration_factor_2 -= 1000;//I say "adds back" but calibration factor starts out very negative
-      LoadCell_2.set_scale(calibration_factor_2);
-      loadCellGo2Reading = (-1 * LoadCell_2.get_units()); //just modified the cal factor, make scale correct
-      loadcellprecision2 = 1; //takes us to precision level 1
-      //Serial.print("precision level 1");
-      //Serial.println();
-      //Serial.print("calibration factor:");
-      //Serial.print(calibration_factor_2, DEC);
-      //Serial.println();
-      //Serial.print("mass reading:");
-      //Serial.print(loadCellGo2Reading, DEC);
-      //Serial.println();
-    }
-    if ((loadcellcalibratedmass <= loadCellGo2Reading) && loadcellprecision2 == 1 && loadcellprecision2 != 0 && loadcellprecision2 != 2 && (loadcellprecision2 != 3)) {
-      calibration_factor_2 -= 100;
-      LoadCell_2.set_scale(calibration_factor_2);
-      loadCellGo2Reading = (-1 * LoadCell_2.get_units());
-      loadcellprecision2 = 2; //takes us to precision level 2
-      //Serial.print("precision level 2");
-      //Serial.println();
-      //Serial.print("calibration factor:");
-      //Serial.print(calibration_factor_2, DEC);
-      //Serial.println();
-      //Serial.print("mass reading:");
-      //Serial.print(loadCellGo2Reading, DEC);
-      //Serial.println();
-    }
-    if ((loadcellcalibratedmass <= loadCellGo2Reading) && loadcellprecision2 == 2 && loadcellprecision2 != 0 && loadcellprecision2 != 1 && (loadcellprecision2 != 3)) {
-      calibration_factor_2 -= 10;
-      LoadCell_2.set_scale(calibration_factor_2);
-      loadCellGo2Reading = (-1 * LoadCell_2.get_units());
-      loadcellprecision2 = 3; //takes us to precision level 3 and trips the exit routine
-      //Serial.print("precision level 3");
-      //Serial.println();
-      //Serial.print("calibration factor:");
-      //Serial.print(calibration_factor_2, DEC);
-      //Serial.println();
-      //Serial.print("mass reading:");
-      //Serial.print(loadCellGo2Reading, DEC);
-      //Serial.println();
-    }
-  }
-}
+void loadCellGo1() { calibrateLoadCell(0); }
+void loadCellGo2() { calibrateLoadCell(1); }
 
 void loadCellDataEntry() {
 
@@ -2729,15 +2315,19 @@ void calibrateMenuUserInput() {
   }// end calibrateInteractiveFirstRun
   if (loadCellCalibrate1_firstrun == 0) { //shortcut, gets us back in loadcellcalibrate1 and data entry without navigating through encoder_pulse
     loadcellCalibrate1();
+    if (stopLatched) return;
   }
   if (loadCellGo1Active == 1) { //similar shortcut, this shorts the data entry thing and lets us get into the actual driving section
     loadCellGo1();
+    if (stopLatched) return;
   }
   if (loadCellGo2Active == 1) { //similar shortcut, this shorts the data entry thing and lets us get into the actual driving section
     loadCellGo2();
+    if (stopLatched) return;
   }
   if (loadCellCalibrate2_firstrun == 0) { //have to do the same thing with 2, or it won't take input
     loadcellCalibrate2();
+    if (stopLatched) return;
   }
   if (calibrateInteractiveFirstRun == 0 && loadCellCalibrate1_firstrun == 1 && loadCellCalibrate2_firstrun == 1) {//once we are no longer in first run (skip the logic code the first loop), also check to see that we're not in loadcell menu underneath
 
@@ -2793,6 +2383,7 @@ void calibrateMenuUserInput() {
         thirdDigitComplete = 0;
         loadCellDataEntryComplete = 0; //gotta reset al lthis so you can calibrate again if you want. if you don't, it's hard to do  common operation of calibrate one first, then other one
         loadcellCalibrate1();
+        if (stopLatched) return;
       }
       if (calibrate_hover_3 == 1) {
         calibrate_hover_3 = 0;
@@ -2802,6 +2393,7 @@ void calibrateMenuUserInput() {
         thirdDigitComplete = 0;
         loadCellDataEntryComplete = 0;
         loadcellCalibrate2();
+        if (stopLatched) return;
       }
     } //end digitalRead==LOW
   } // end "no longer the first run"
@@ -6591,7 +6183,7 @@ void mainMenu() {
   if (ignoreLoadCell_1 == 0) {
     //print load cell 1 to screen
     lcd.setCursor(3, 2); //aim for spot next to "L1:"
-    lcd.print(loadCell1Reading);
+    printLoadCell(0, loadCell1Reading);
     lcd.print("g");
   }
   if (ignoreLoadCell_1 == 1) {
@@ -6602,7 +6194,7 @@ void mainMenu() {
   if (ignoreLoadCell_2 == 0) {
     //print load cell 2 to screen
     lcd.setCursor(13, 2); //aim for spot next to "L2:"
-    lcd.print(loadCell2Reading);
+    printLoadCell(1, loadCell2Reading);
     lcd.print("g");
   }
   if (ignoreLoadCell_2 == 1) {
@@ -6636,11 +6228,11 @@ void mainMenu() {
   }
   //nonzeroed load cell values
   if (ignoreLoadCell_1 == 0) {
-    loadCell1Reading = LoadCell_1.get_units(); //unlike loadCellGo, we use this to change the direction of the vector to have positive force be up instead of down
+    loadCell1Reading = displayLoadCell(LoadCell_1); //unlike loadCellGo, we use this to change the direction of the vector to have positive force be up instead of down
   }
 
-  if (ignoreLoadCell_1 == 0) {
-    loadCell2Reading = LoadCell_2.get_units(); //unlike loadCellGo, we use this to change the direction of the vector to have positive force be up instead of down
+  if (ignoreLoadCell_2 == 0) {
+    loadCell2Reading = displayLoadCell(LoadCell_2); //unlike loadCellGo, we use this to change the direction of the vector to have positive force be up instead of down
   }
 }//end mainMenu()
 
@@ -6715,11 +6307,11 @@ void runMenu() {
     lcd.print("hPa"); //equivalent to mbar but also 1 letter shorter, more space on the menu. I would have otherwise set this to say mbar
     //print load cell 1 to screen
     lcd.setCursor(3, 2); //aim for spot next to "L1:"
-    lcd.print(loadCell1Reading);
+    printLoadCell(0, loadCell1Reading);
     lcd.print("g"); //equivalent to mbar but also 1 letter shorter, more space on the menu. I would have otherwise set this to say mbar
     //print load cell 2 to screen
     lcd.setCursor(13, 2); //aim for spot next to "L2:"
-    lcd.print(loadCell2Reading);
+    printLoadCell(1, loadCell2Reading);
     lcd.print("g"); //equivalent to mbar but also 1 letter shorter, more space on the menu. I would have otherwise set this to say mbar
 
     //similar logic to the anemometer, no value is the bad sign
@@ -6738,11 +6330,11 @@ void runMenu() {
     }
 
     if (ignoreLoadCell_1 == 0 ) {
-      loadCell1Reading = LoadCell_1.get_units(); //unlike loadCellGo, we use this to change the direction of the vector to have positive force be up instead of down
+      loadCell1Reading = displayLoadCell(LoadCell_1); //unlike loadCellGo, we use this to change the direction of the vector to have positive force be up instead of down
     }
 
     if (ignoreLoadCell_2 == 0) {
-      loadCell2Reading = LoadCell_2.get_units(); //unlike loadCellGo, we use this to change the direction of the vector to have positive force be up instead of down
+      loadCell2Reading = displayLoadCell(LoadCell_2); //unlike loadCellGo, we use this to change the direction of the vector to have positive force be up instead of down
     }
 
     if (ignoreLoadCell_1 == 1 ) {
@@ -6777,12 +6369,12 @@ void aboutDisplay() { //should be handled by the displayUpdate state machine so 
 }
 
 
-void tcaselect(uint8_t i) {
-  if (i > 7) return;
+bool tcaselect(uint8_t i) {
+  if (i > 7) return false;
 
   Wire.beginTransmission(TCAADDR);
   Wire.write(1 << i);
-  Wire.endTransmission();
+  return Wire.endTransmission() == 0;
 }
 
 //this function reads the i2c multiplexers sequentially from 0x70-0x77 (if applicable) and per i2c multiplexer reads from channel 0-7
@@ -6825,108 +6417,53 @@ void tcaselect(uint8_t i) {
   }
 */
 
-void baroRead() {//this will hide the actual read code and set a value for pressure given a sensor. that way all you have to do to read a sensor is ask after setting baroSelect. starts at 0
-  /* Get a new sensor event */
-  //Serial.print("baroRead!");
-  sensors_event_t event;
-  if (baroSelect == 0) { //sensor number that was picked
-    tcaselect(0); //set the channel
-    bmp1.getEvent(&event); //lags loop by 35 ms per sensor requested
-    if (event.pressure) {
-      baro0 = event.pressure;
+void baroRead() {
+  if (baroSelect > 6) return;
+  sensors_event_t event = {}; // never reuse an old pressure on a failed read
+#if defined(WIRE_HAS_TIMEOUT)
+  Wire.clearWireTimeoutFlag();
+#endif
+  const bool selected = tcaselect(baroSelect);
+  bool readOK = false;
+  if (selected && pressureInitialized[baroSelect]) {
+    switch (baroSelect) {
+      case 0: readOK = bmp1.begin() && bmp1.getEvent(&event); break;
+      case 1: readOK = bmp2.begin() && bmp2.getEvent(&event); break;
+      case 2: readOK = bmp3.begin() && bmp3.getEvent(&event); break;
+      case 3: readOK = bmp4.begin() && bmp4.getEvent(&event); break;
+      case 4: readOK = bmp5.begin() && bmp5.getEvent(&event); break;
+      case 5: readOK = bmp6.begin() && bmp6.getEvent(&event); break;
+      case 6: readOK = bmp7.begin() && bmp7.getEvent(&event); break;
     }
-  } //end BaroSelect == 0
-
-  if (baroSelect == 1) { //sensor number that was picked
-    tcaselect(1); //set the channel
-    bmp2.getEvent(&event);
-    if (event.pressure) {
-      baro1 = event.pressure;
-    }
-  } //end BaroSelect == 1
-
-  if (baroSelect == 2) { //sensor number that was picked
-    tcaselect(2); //set the channel
-    bmp3.getEvent(&event);
-    if (event.pressure) {
-      baro2 = event.pressure;
-    }
-  } //end BaroSelect == 2
-
-  if (baroSelect == 3) { //sensor number that was picked
-    tcaselect(3); //set the channel
-    bmp4.getEvent(&event);
-    if (event.pressure) {
-      baro3 = event.pressure;
-    }
-  } //end BaroSelect == 3
-
-  if (baroSelect == 4) { //sensor number that was picked
-    tcaselect(4); //set the channel
-    bmp5.getEvent(&event);
-    if (event.pressure) {
-      baro4 = event.pressure;
-    }
-  } //end BaroSelect == 4
-
-  if (baroSelect == 5) { //sensor number that was picked
-    tcaselect(5); //set the channel
-    bmp6.getEvent(&event);
-    if (event.pressure) {
-      baro5 = event.pressure;
-    }
-  } //end BaroSelect == 5
-
-  if (baroSelect == 6) { //sensor number that was picked
-    tcaselect(6); //set the channel
-    bmp7.getEvent(&event);
-    if (event.pressure) {
-      baro6 = event.pressure;
-    }
-  } //end BaroSelect == 6
-}//end baroRead()
+  }
+#if defined(WIRE_HAS_TIMEOUT)
+  if (Wire.getWireTimeoutFlag()) readOK = false;
+#endif
+  // The pinned BMP driver shares factory coefficients between instances.
+  // begin() above reloads the selected device's coefficients before every read.
+  pressureValid[baroSelect] = readOK && isfinite(event.pressure) &&
+                            event.pressure >= 300.0f && event.pressure <= 1100.0f;
+  const float value = pressureValid[baroSelect] ? event.pressure : NAN;
+  switch (baroSelect) {
+    case 0: baro0 = value; break;
+    case 1: baro1 = value; break;
+    case 2: baro2 = value; break;
+    case 3: baro3 = value; break;
+    case 4: baro4 = value; break;
+    case 5: baro5 = value; break;
+    case 6: baro6 = value; break;
+  }
+}
 
 void startupSensorErrorHandler() {
-  //begin checking for the two i2c boards here
-  //i2c 1 + attached devices
-  for (uint8_t t = 0; t < 8; t++) { //this function can handle multiple TCA boards but we're just using one. final digit matches how many channels you have total, starting at 1. Multiplexers should go in sequential order, 0x70, 0x71 to 0x77
-    tcaselect(t);
-    //Serial.print("TCA Port #"); Serial.println(t); //showing which TCA channel we're on
-
-    for (uint8_t addr = 0; addr <= 127; addr++) {
-      if (addr == TCAADDR) continue; //skip looking for the first TCA multiplexer
-      if (addr == (TCAADDR + 1)) continue; //skip looking for the 2nd TCA multiplexer, 1 up from the first. add more offsets for multiple boards
-      if (addr == (ANEM_I2C_ADDR)) continue; //skip the anemometer, we know it's there (or not) through other checks
-
-      Wire.beginTransmission(addr);
-      if (!Wire.endTransmission()) {
-        //Serial.print("Found I2C 0x");  Serial.println(addr, HEX); //polling for i2c addresses
-        //begin barometer checks
-        if ((t == 0 ) && (addr == 77, HEX)) {
-          barofail_1 = 0;
-        }
-        if ((t == 1 ) && (addr == 77, HEX)) {
-          barofail_2 = 0;
-        }
-        if ((t == 2 ) && (addr == 77, HEX)) {
-          barofail_3 = 0;
-        }
-        if ((t == 3 ) && (addr == 77, HEX)) {
-          barofail_4 = 0;
-        }
-        if ((t == 4 ) && (addr == 77, HEX)) {
-          barofail_5 = 0;
-        }
-        if ((t == 5 ) && (addr == 77, HEX)) {
-          barofail_6 = 0;
-        }
-        if ((t == 6 ) && (addr == 77, HEX)) {
-          barofail_7 = 0;
-        }
-        //end baro checks
-      }//end !Wire.endTransmission
-    }//end i2c address scan
-  }//end i2c barometer scan
+  // begin() validates each expected device ID on its selected channel.
+  barofail_1 = !pressureInitialized[0];
+  barofail_2 = !pressureInitialized[1];
+  barofail_3 = !pressureInitialized[2];
+  barofail_4 = !pressureInitialized[3];
+  barofail_5 = !pressureInitialized[4];
+  barofail_6 = !pressureInitialized[5];
+  barofail_7 = !pressureInitialized[6];
   //begin i2c anemometer check
   addr = ANEM_I2C_ADDR; //set addr to check for the anemometer at whatever the library says the address should be
   Wire.beginTransmission(addr);
